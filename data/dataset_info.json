@@ -422,5 +422,49 @@
       "prompt": "content"
     },
     "folder": "python"
+  },
+  "aar_k2_en":{
+    "file_name": "c4_watermarked/json/train/en/Llama-2-7b-hf_aar_k2_c4_en_train_1000000.json",
+    "columns": {
+      "prompt": "text"
+    }
+  },
+  "aar_k3_en":{
+    "file_name": "c4_watermarked/json/train/en/Llama-2-7b-hf_aar_k3_c4_en_train_1000000.json",
+    "columns": {
+      "prompt": "text"
+    }
+  },
+  "aar_k2_mu":{
+    "file_name": "c4_watermarked/json/train/mu/Llama-2-7b-hf_aar_k2_c4_mu_train_1000000.json",
+    "columns": {
+      "prompt": "text"
+    }
+  },
+  "aar_k3_mu":{
+    "file_name": "c4_watermarked/json/train/mu/Llama-2-7b-hf_aar_k3_c4_mu_train_1000000.json",
+    "columns": {
+      "prompt": "text"
+    }
+  },
+  "aar_k4_mu":{
+    "file_name": "c4_watermarked/json/train/mu/Llama-2-7b-hf_aar_k2_c4_mu_train_1000000.json",
+    "columns": {
+      "prompt": "text"
+    }
+  },
+  "kgw_gamma0.25_delta2_mu":{
+    "file_name": "c4_watermarked/json/train/mu/Llama-2-7b-hf_kgw_gamma0.25_delta2.0_c4_mu_train_1000000.json",
+    "columns": {
+      "prompt": "text"
+    }
+  },
+  "dolly-15k": {
+    "script_url": "databricks_dolly_15k",
+    "columns": {
+      "prompt": "instruction",
+      "query": "context",
+      "response": "response"
+    }
   }
 }

@@ -1,42 +1,45 @@
 # model
-model_name_or_path: /home/yijiexu/LLMWatermark/WM-Open-Source-LLM/models/Llama-2-7b-hf \
+model_name_or_path: /home/yijiexu/LLMWatermark/WM-Open-Source-LLM/models/Llama-2-7b-hf
 
 # method
-stage: sft
+stage: pt
 do_train: true
 finetuning_type: lora
-lora_target: q_proj,v_proj
+# lora_target: q_proj,v_proj
+lora_target: all
+lora_rank: 8
 
 # ddp
 ddp_timeout: 180000000
 deepspeed: examples/deepspeed/ds_z3_config.json
 
 # dataset
-dataset: identity,alpaca_gpt4_en
-template: llama3
+dataset: aar_k4_mu
+template: llama2
 cutoff_len: 1024
-max_samples: 1000
+max_samples: 3000
 val_size: 0.1
 overwrite_cache: true
 preprocessing_num_workers: 16
 
 # output
-output_dir: saves/llama3-8b/lora/sft
+output_dir: saves/LLaMA2-7B/lora/pt/aar/k4/mu_r8
 logging_steps: 10
-save_steps: 500
+save_steps: 200
 plot_loss: true
 overwrite_output_dir: true
 
 # train
 per_device_train_batch_size: 1
-gradient_accumulation_steps: 2
-learning_rate: 0.0001
-num_train_epochs: 3.0
+gradient_accumulation_steps: 1
+learning_rate: 0.00005
+num_train_epochs: 10.0
 lr_scheduler_type: cosine
 warmup_steps: 0.1
-fp16: true
+bf16: true
+save_only_model: true
 
 # eval
 per_device_eval_batch_size: 1
 evaluation_strategy: steps
-eval_steps: 500
+eval_steps: 100
