@@ -694,5 +694,21 @@
       "prompt": "content"
     },
     "folder": "python"
+  },
+  "simple": {
+  "file_name": "optimal_branching/simple.json",
+  "columns": {
+    "prompt": "instruction",
+    "query": "input",
+    "response": "output"
+    }
+  },
+  "complex": {
+  "file_name": "optimal_branching/complex.json",
+  "columns": {
+    "prompt": "instruction",
+    "query": "input",
+    "response": "output"
+    }
   }
 }
