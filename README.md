@@ -42,6 +42,7 @@ Choose your path:
 - **Local machine**: Please refer to [usage](#getting-started)
 - **PAI-DSW (free trial)**: [Llama3 Example](https://gallery.pai-ml.com/#/preview/deepLearning/nlp/llama_factory) | [Qwen2-VL Example](https://gallery.pai-ml.com/#/preview/deepLearning/nlp/llama_factory_qwen2vl) | [DeepSeek-R1-Distill Example](https://gallery.pai-ml.com/#/preview/deepLearning/nlp/llama_factory_deepseek_r1_distill_7b)
 - **Amazon SageMaker**: [Blog](https://aws.amazon.com/cn/blogs/china/a-one-stop-code-free-model-fine-tuning-deployment-platform-based-on-sagemaker-and-llama-factory/)
+- **Easy Dataset**: [Fine-tune on Synthetic Data](https://buaa-act.feishu.cn/wiki/GVzlwYcRFiR8OLkHbL6cQpYin7g)
 
 > [!NOTE]
 > Except for the above links, all other websites are unauthorized third-party websites. Please carefully use them.
@@ -383,6 +384,7 @@ You also can add a custom chat template to [template.py](src/llamafactory/data/t
 
 - [DPO mixed (en&zh)](https://huggingface.co/datasets/hiyouga/DPO-En-Zh-20k)
 - [UltraFeedback (en)](https://huggingface.co/datasets/HuggingFaceH4/ultrafeedback_binarized)
+- [COIG-P (en&zh)](https://huggingface.co/datasets/m-a-p/COIG-P)
 - [RLHF-V (en)](https://huggingface.co/datasets/openbmb/RLHF-V-Dataset)
 - [VLFeedback (en)](https://huggingface.co/datasets/Zhihui/VLFeedback)
 - [Orca DPO Pairs (en)](https://huggingface.co/datasets/Intel/orca_dpo_pairs)
@@ -556,6 +558,8 @@ Please refer to [data/README.md](data/README.md) for checking the details about 
 
 > [!NOTE]
 > Please update `data/dataset_info.json` to use your custom dataset.
+
+You can also use **[Easy Dataset](https://github.com/ConardLi/easy-dataset)** to create synthetic data for fine-tuning.
 
 ### Quickstart
 
