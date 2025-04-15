@@ -40,10 +40,12 @@ https://github.com/user-attachments/assets/43b700c6-a178-41db-b1f8-8190a5d3fcfc
 
 - **入门教程**：https://zhuanlan.zhihu.com/p/695287607
 - **框架文档**：https://llamafactory.readthedocs.io/zh-cn/latest/
+- **框架文档（昇腾 NPU）**：https://ascend.github.io/docs/sources/llamafactory/
 - **Colab（免费）**：https://colab.research.google.com/drive/1d5KQtbemerlSDSxZIfAaWXhKr30QypiK?usp=sharing
 - **本地机器**：请见[如何使用](#如何使用)
 - **PAI-DSW（免费试用）**：[Llama3 案例](https://gallery.pai-ml.com/#/preview/deepLearning/nlp/llama_factory) | [Qwen2-VL 案例](https://gallery.pai-ml.com/#/preview/deepLearning/nlp/llama_factory_qwen2vl) | [DeepSeek-R1-Distill 案例](https://gallery.pai-ml.com/#/preview/deepLearning/nlp/llama_factory_deepseek_r1_distill_7b)
 - **Amazon SageMaker**：[博客](https://aws.amazon.com/cn/blogs/china/a-one-stop-code-free-model-fine-tuning-deployment-platform-based-on-sagemaker-and-llama-factory/)
+- **Easy Dataset**：[数据蒸馏微调](https://buaa-act.feishu.cn/wiki/KY9xwTGs1iqHrRkjXBwcZP9WnL9)
 
 > [!NOTE]
 > 除上述链接以外的其他网站均为未经许可的第三方网站，请小心甄别。
@@ -107,6 +109,8 @@ https://github.com/user-attachments/assets/43b700c6-a178-41db-b1f8-8190a5d3fcfc
 </details>
 
 ## 更新日志
+
+[25/04/14] 我们支持了 **[GLM-Z1](https://huggingface.co/THUDM/GLM-Z1-9B-0414)** 和 **[Kimi-VL](https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct)** 模型的微调。
 
 [25/04/06] 我们支持了 **[Llama 4](https://ai.meta.com/blog/llama-4-multimodal-intelligence/)** 模型的微调。查看 [PR #7611](https://github.com/hiyouga/LLaMA-Factory/pull/7611) 以使用。
 
@@ -240,17 +244,18 @@ https://github.com/user-attachments/assets/43b700c6-a178-41db-b1f8-8190a5d3fcfc
 | [Falcon](https://huggingface.co/tiiuae)                           | 7B/11B/40B/180B                  | falcon              |
 | [Gemma/Gemma 2/CodeGemma](https://huggingface.co/google)          | 2B/7B/9B/27B                     | gemma               |
 | [Gemma 3](https://huggingface.co/google)                          | 1B/4B/12B/27B                    | gemma3/gemma (1B)   |
-| [GLM-4](https://huggingface.co/THUDM)                             | 9B                               | glm4                |
+| [GLM-4/GLM-4-0414/GLM-Z1](https://huggingface.co/THUDM)           | 9B/32B                           | glm4                |
 | [GPT-2](https://huggingface.co/openai-community)                  | 0.1B/0.4B/0.8B/1.5B              | -                   |
 | [Granite 3.0-3.1](https://huggingface.co/ibm-granite)             | 1B/2B/3B/8B                      | granite3            |
 | [Hunyuan](https://huggingface.co/tencent/)                        | 7B                               | hunyuan             |
 | [Index](https://huggingface.co/IndexTeam)                         | 1.9B                             | index               |
 | [InternLM 2-3](https://huggingface.co/internlm)                   | 7B/8B/20B                        | intern2             |
+| [Kimi-VL](https://huggingface.co/moonshotai)                      | 16B                              | kimi_vl             |
 | [Llama](https://github.com/facebookresearch/llama)                | 7B/13B/33B/65B                   | -                   |
 | [Llama 2](https://huggingface.co/meta-llama)                      | 7B/13B/70B                       | llama2              |
 | [Llama 3-3.3](https://huggingface.co/meta-llama)                  | 1B/3B/8B/70B                     | llama3              |
-| [Llama 3.2 Vision](https://huggingface.co/meta-llama)             | 11B/90B                          | mllama              |
 | [Llama 4](https://huggingface.co/meta-llama)                      | 109B/402B                        | llama4              |
+| [Llama 3.2 Vision](https://huggingface.co/meta-llama)             | 11B/90B                          | mllama              |
 | [LLaVA-1.5](https://huggingface.co/llava-hf)                      | 7B/13B                           | llava               |
 | [LLaVA-NeXT](https://huggingface.co/llava-hf)                     | 7B/8B/13B/34B/72B/110B           | llava_next          |
 | [LLaVA-NeXT-Video](https://huggingface.co/llava-hf)               | 7B/34B                           | llava_next_video    |
@@ -266,9 +271,9 @@ https://github.com/user-attachments/assets/43b700c6-a178-41db-b1f8-8190a5d3fcfc
 | [Phi-3-small](https://huggingface.co/microsoft)                   | 7B                               | phi_small           |
 | [Phi-4](https://huggingface.co/microsoft)                         | 14B                              | phi4                |
 | [Pixtral](https://huggingface.co/mistralai)                       | 12B                              | pixtral             |
-| [Qwen/QwQ (1-2.5) (Code/Math/MoE)](https://huggingface.co/Qwen)   | 0.5B/1.5B/3B/7B/14B/32B/72B/110B | qwen                |
+| [Qwen (1-2.5) (Code/Math/MoE/QwQ)](https://huggingface.co/Qwen)   | 0.5B/1.5B/3B/7B/14B/32B/72B/110B | qwen                |
 | [Qwen2-Audio](https://huggingface.co/Qwen)                        | 7B                               | qwen2_audio         |
-| [Qwen2.5-Omni](https://huggingface.co/Qwen)                       | 7B                               | qwen2_omni          |
+| [Qwen2.5-Omni](https://huggingface.co/Qwen)\*\*                   | 7B                               | qwen2_omni          |
 | [Qwen2-VL/Qwen2.5-VL/QVQ](https://huggingface.co/Qwen)            | 2B/3B/7B/32B/72B                 | qwen2_vl            |
 | [Skywork o1](https://huggingface.co/Skywork)                      | 8B                               | skywork_o1          |
 | [StarCoder 2](https://huggingface.co/bigcode)                     | 3B/7B/15B                        | -                   |
@@ -282,6 +287,10 @@ https://github.com/user-attachments/assets/43b700c6-a178-41db-b1f8-8190a5d3fcfc
 > 对于所有“基座”（Base）模型，`template` 参数可以是 `default`, `alpaca`, `vicuna` 等任意值。但“对话”（Instruct/Chat）模型请务必使用**对应的模板**。
 >
 > 请务必在训练和推理时采用**完全一致**的模板。
+>
+> \*：您需要从 main 分支安装 `transformers` 并使用 `DISABLE_VERSION_CHECK=1` 来跳过版本检查。
+>
+> \*\*：您需要安装特定版本的 `transformers` 以使用该模型。
 
 项目所支持模型的完整列表请参阅 [constants.py](src/llamafactory/extras/constants.py)。
 
@@ -385,6 +394,7 @@ https://github.com/user-attachments/assets/43b700c6-a178-41db-b1f8-8190a5d3fcfc
 
 - [DPO mixed (en&zh)](https://huggingface.co/datasets/hiyouga/DPO-En-Zh-20k)
 - [UltraFeedback (en)](https://huggingface.co/datasets/HuggingFaceH4/ultrafeedback_binarized)
+- [COIG-P (en&zh)](https://huggingface.co/datasets/m-a-p/COIG-P)
 - [RLHF-V (en)](https://huggingface.co/datasets/openbmb/RLHF-V-Dataset)
 - [VLFeedback (en)](https://huggingface.co/datasets/Zhihui/VLFeedback)
 - [Orca DPO Pairs (en)](https://huggingface.co/datasets/Intel/orca_dpo_pairs)
@@ -404,7 +414,7 @@ huggingface-cli login
 
 ## 软硬件依赖
 
-| 必需项       | 至少     | 推荐      |
+| 必需项        | 至少     | 推荐      |
 | ------------ | ------- | --------- |
 | python       | 3.9     | 3.10      |
 | torch        | 1.13.1  | 2.6.0     |
@@ -414,7 +424,7 @@ huggingface-cli login
 | peft         | 0.14.0  | 0.15.0    |
 | trl          | 0.8.6   | 0.9.6     |
 
-| 可选项       | 至少     | 推荐      |
+| 可选项        | 至少     | 推荐      |
 | ------------ | ------- | --------- |
 | CUDA         | 11.6    | 12.2      |
 | deepspeed    | 0.10.0  | 0.16.4    |
@@ -559,6 +569,8 @@ pip install .
 
 > [!NOTE]
 > 使用自定义数据集时，请更新 `data/dataset_info.json` 文件。
+
+您也可以使用 **[Easy Dataset](https://github.com/ConardLi/easy-dataset)** 构建用于微调的合成数据。
 
 ### 快速开始
 
