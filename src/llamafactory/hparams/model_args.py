@@ -65,7 +65,13 @@ class BaseModelArguments:
         default=False,
         metadata={"help": "Whether or not the special tokens should be split during the tokenization process."},
     )
-    new_special_tokens: Optional[str] = field(
+    add_tokens: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Non-special tokens to be added into the tokenizer. Use commas to separate multiple tokens."
+        },
+    )
+    add_special_tokens: Optional[str] = field(
         default=None,
         metadata={"help": "Special tokens to be added into the tokenizer. Use commas to separate multiple tokens."},
     )
@@ -176,8 +182,11 @@ class BaseModelArguments:
         if self.adapter_name_or_path is not None:  # support merging multiple lora weights
             self.adapter_name_or_path = [path.strip() for path in self.adapter_name_or_path.split(",")]
 
-        if self.new_special_tokens is not None:  # support multiple special tokens
-            self.new_special_tokens = [token.strip() for token in self.new_special_tokens.split(",")]
+        if self.add_tokens is not None:  # support multiple tokens
+            self.add_tokens = [token.strip() for token in self.add_tokens.split(",")]
+
+        if self.add_special_tokens is not None:  # support multiple special tokens
+            self.add_special_tokens = [token.strip() for token in self.add_special_tokens.split(",")]
 
 
 @dataclass
@@ -222,9 +231,9 @@ class ProcessorArguments:
         default=False,
         metadata={"help": "Use pan and scan to process image for gemma3."},
     )
-    use_audio_in_video: bool = field(
+    crop_to_patches: bool = field(
         default=False,
-        metadata={"help": "Whether or not to use audio in video inputs."},
+        metadata={"help": "Whether to crop the image to patches for internvl."},
     )
     video_max_pixels: int = field(
         default=256 * 256,
@@ -241,6 +250,10 @@ class ProcessorArguments:
     video_maxlen: int = field(
         default=128,
         metadata={"help": "The maximum number of sampled frames for video inputs."},
+    )
+    use_audio_in_video: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to use audio in video inputs."},
     )
     audio_sampling_rate: int = field(
         default=16000,
@@ -350,6 +363,12 @@ class SGLangArguments:
     sglang_config: Optional[Union[dict, str]] = field(
         default=None,
         metadata={"help": "Config to initialize the SGLang engine. Please use JSON strings."},
+    )
+    sglang_lora_backend: Literal["triton", "flashinfer"] = field(
+        default="triton",
+        metadata={
+            "help": "The backend of running GEMM kernels for Lora modules. Recommend using the Triton LoRA backend for better performance and stability."
+        },
     )
 
     def __post_init__(self):

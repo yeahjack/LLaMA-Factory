@@ -202,6 +202,15 @@ class RLHFArguments:
         default="lora",
         metadata={"help": "The type of the reward model in PPO training. Lora model only supports lora training."},
     )
+    ld_alpha: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Alpha parameter from the LD-DPO paper, which controls the weighting of"
+                " the verbose token log-probabilities in responses."
+            )
+        },
+    )
 
 
 @dataclass
@@ -411,6 +420,10 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to use the Adam-mini optimizer."},
     )
+    use_muon: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to use the Muon optimizer."},
+    )
     freeze_vision_tower: bool = field(
         default=True,
         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},
@@ -430,6 +443,10 @@ class FinetuningArguments(
     disable_shuffling: bool = field(
         default=False,
         metadata={"help": "Whether or not to disable the shuffling of the training set."},
+    )
+    early_stopping_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of steps to stop training if the `metric_for_best_model` does not improve."},
     )
     plot_loss: bool = field(
         default=False,

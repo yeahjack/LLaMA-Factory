@@ -76,7 +76,7 @@ def fix_valuehead_checkpoint(
             state_dict: dict[str, torch.Tensor] = {key: f.get_tensor(key) for key in f.keys()}
     else:
         path_to_checkpoint = os.path.join(output_dir, WEIGHTS_NAME)
-        state_dict: dict[str, torch.Tensor] = torch.load(path_to_checkpoint, map_location="cpu")
+        state_dict: dict[str, torch.Tensor] = torch.load(path_to_checkpoint, map_location="cpu", weights_only=True)
 
     os.remove(path_to_checkpoint)
     decoder_state_dict, v_head_state_dict = {}, {}
@@ -188,7 +188,7 @@ class LogCallback(TrainerCallback):
         self.webui_mode = is_env_enabled("LLAMABOARD_ENABLED")
         if self.webui_mode and not use_ray():
             signal.signal(signal.SIGABRT, self._set_abort)
-            self.logger_handler = logging.LoggerHandler(os.environ.get("LLAMABOARD_WORKDIR"))
+            self.logger_handler = logging.LoggerHandler(os.getenv("LLAMABOARD_WORKDIR"))
             logging.add_handler(self.logger_handler)
             transformers.logging.add_handler(self.logger_handler)
 

@@ -50,7 +50,7 @@ class LoggerHandler(logging.Handler):
 
     def _write_log(self, log_entry: str) -> None:
         with open(self.running_log, "a", encoding="utf-8") as f:
-            f.write(log_entry + "\n\n")
+            f.write(log_entry + "\n")
 
     def emit(self, record) -> None:
         if record.name == "httpx":
@@ -79,7 +79,7 @@ class _Logger(logging.Logger):
 
 def _get_default_logging_level() -> "logging._Level":
     r"""Return the default logging level."""
-    env_level_str = os.environ.get("LLAMAFACTORY_VERBOSITY", None)
+    env_level_str = os.getenv("LLAMAFACTORY_VERBOSITY", None)
     if env_level_str:
         if env_level_str.upper() in logging._nameToLevel:
             return logging._nameToLevel[env_level_str.upper()]
