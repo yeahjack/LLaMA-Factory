@@ -716,19 +716,217 @@
     "folder": "python"
   },
   "simple": {
-  "file_name": "optimal_branching/simple.json",
-  "columns": {
-    "prompt": "instruction",
-    "query": "input",
-    "response": "output"
+    "file_name": "optimal_branching/simple.json",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
     }
   },
   "complex": {
-  "file_name": "optimal_branching/complex.json",
-  "columns": {
-    "prompt": "instruction",
-    "query": "input",
-    "response": "output"
+    "file_name": "optimal_branching/complex.json",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "backward_data": {
+    "file_name": "self_alignment/reversed_openassistant.json",
+    "columns": {
+      "prompt": "input",
+      "response": "output"
+    }
+  },
+  "instruction_finetune_high_quality": {
+    "file_name": "self_alignment/instruction_finetune_high_quality.json",
+    "columns": {
+      "prompt": "input",
+      "response": "output"
+    }
+  },
+  "dpo_lima_50": {
+    "file_name": "dpo_lima_50.json",
+    "ranking": true,
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "chosen": "chosen",
+      "rejected": "rejected"
+    }
+  },
+  "db_geosignal": {
+    "file_name": "geosignal/train.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "db_agriculture": {
+    "file_name": "agriculture/train.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "question",
+      "response": "answers"
+    }
+  },
+  "db_genmedgpt-5k": {
+    "file_name": "genmedgpt/train.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "db_wealth": {
+    "file_name": "wealth/train.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "ib_dolly": {
+    "file_name": "dolly-15k/train.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "context",
+      "response": "response"
+    }
+  },
+  "ib_alpaca-gpt4": {
+    "file_name": "alpaca/train.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "ib_instructionwild": {
+    "file_name": "instructionwild/train.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "rb_gsm8k": {
+    "file_name": "gsm8k/train.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "question",
+      "response": "answer"
+    }
+  },
+  "rb_metamath": {
+    "file_name": "metamathqa/train.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "query",
+      "response": "response"
+    }
+  },
+  "rb_logiqa": {
+    "file_name": "logiqa/train.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "db_geosignal_test": {
+    "file_name": "geosignal/test.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "db_agriculture_test": {
+    "file_name": "agriculture/test.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "question",
+      "response": "answers"
+    }
+  },
+  "db_genmedgpt-5k_test": {
+    "file_name": "genmedgpt/test.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "db_wealth_test": {
+    "file_name": "wealth/test.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "ib_dolly_test": {
+    "file_name": "dolly-15k/test.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "context",
+      "response": "response"
+    }
+  },
+  "ib_alpaca-gpt4_test": {
+    "file_name": "alpaca/test.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "ib_instructionwild_test": {
+    "file_name": "instructionwild/test.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "rb_gsm8k_test": {
+    "file_name": "gsm8k/test.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "question",
+      "response": "answer"
+    }
+  },
+  "rb_metamath_test": {
+    "file_name": "metamathqa/test.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "query",
+      "response": "response"
+    }
+  },
+  "rb_logiqa_test": {
+    "file_name": "logiqa/test.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
     }
   }
 }
