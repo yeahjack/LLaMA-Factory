@@ -756,24 +756,23 @@
     }
   },
   "db_geosignal": {
-    "file_name": "geosignal/train.json",
+    "file_name": "geosignal/test.json",
     "formatting": "alpaca",
     "columns": {
       "prompt": "instruction",
-      "query": "input",
       "response": "output"
     }
   },
   "db_agriculture": {
-    "file_name": "agriculture/train.json",
+    "file_name": "agriculture/test.json",
     "formatting": "alpaca",
     "columns": {
-      "prompt": "question",
+      "query": "question",
       "response": "answers"
     }
   },
-  "db_genmedgpt-5k": {
-    "file_name": "genmedgpt/train.json",
+  "db_genmedgpt": {
+    "file_name": "genmedgpt/test.json",
     "formatting": "alpaca",
     "columns": {
       "prompt": "instruction",
@@ -782,7 +781,7 @@
     }
   },
   "db_wealth": {
-    "file_name": "wealth/train.json",
+    "file_name": "wealth/test.json",
     "formatting": "alpaca",
     "columns": {
       "prompt": "instruction",
@@ -791,16 +790,16 @@
     }
   },
   "ib_dolly": {
-    "file_name": "dolly-15k/train.json",
+    "file_name": "dolly-15k/test.json",
     "formatting": "alpaca",
     "columns": {
       "prompt": "instruction",
-      "query": "context",
-      "response": "response"
+      "query": "input",
+      "response": "output"
     }
   },
-  "ib_alpaca-gpt4": {
-    "file_name": "alpaca/train.json",
+  "ib_alpaca": {
+    "file_name": "alpaca/test.json",
     "formatting": "alpaca",
     "columns": {
       "prompt": "instruction",
@@ -809,7 +808,7 @@
     }
   },
   "ib_instructionwild": {
-    "file_name": "instructionwild/train.json",
+    "file_name": "instructionwild/test.json",
     "formatting": "alpaca",
     "columns": {
       "prompt": "instruction",
@@ -818,26 +817,27 @@
     }
   },
   "rb_gsm8k": {
-    "file_name": "gsm8k/train.json",
+    "file_name": "gsm8k/valid.json",
     "formatting": "alpaca",
     "columns": {
-      "prompt": "question",
-      "response": "answer"
+      "prompt": "input",
+      "query": "instruction",
+      "response": "output"
     }
   },
   "rb_metamath": {
-    "file_name": "metamathqa/train.json",
+    "file_name": "metamathqa/valid.json",
     "formatting": "alpaca",
     "columns": {
-      "prompt": "query",
-      "response": "response"
+      "prompt": "input",
+      "query": "instruction",
+      "response": "output"
     }
   },
   "rb_logiqa": {
-    "file_name": "logiqa/train.json",
+    "file_name": "logiqa/valid.json",
     "formatting": "alpaca",
     "columns": {
-      "prompt": "instruction",
       "query": "input",
       "response": "output"
     }
@@ -847,7 +847,6 @@
     "formatting": "alpaca",
     "columns": {
       "prompt": "instruction",
-      "query": "input",
       "response": "output"
     }
   },
@@ -859,7 +858,7 @@
       "response": "answers"
     }
   },
-  "db_genmedgpt-5k_test": {
+  "db_genmedgpt_test": {
     "file_name": "genmedgpt/test.json",
     "formatting": "alpaca",
     "columns": {
@@ -882,11 +881,11 @@
     "formatting": "alpaca",
     "columns": {
       "prompt": "instruction",
-      "query": "context",
-      "response": "response"
+      "query": "input",
+      "response": "output"
     }
   },
-  "ib_alpaca-gpt4_test": {
+  "ib_alpaca_test": {
     "file_name": "alpaca/test.json",
     "formatting": "alpaca",
     "columns": {
@@ -908,23 +907,24 @@
     "file_name": "gsm8k/test.json",
     "formatting": "alpaca",
     "columns": {
-      "prompt": "question",
-      "response": "answer"
+      "prompt": "input",
+      "query": "instruction",
+      "response": "output"
     }
   },
   "rb_metamath_test": {
     "file_name": "metamathqa/test.json",
     "formatting": "alpaca",
     "columns": {
-      "prompt": "query",
-      "response": "response"
+      "prompt": "input",
+      "query": "instruction",
+      "response": "output"
     }
   },
   "rb_logiqa_test": {
     "file_name": "logiqa/test.json",
     "formatting": "alpaca",
     "columns": {
-      "prompt": "instruction",
       "query": "input",
       "response": "output"
     }

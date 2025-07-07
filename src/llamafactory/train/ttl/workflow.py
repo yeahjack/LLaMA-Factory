@@ -94,39 +94,47 @@ def run_ttl(
     def compute_ttl_loss(outputs, labels, num_items_in_batch=None):
         logits = outputs["logits"]
         input_ids = outputs["input_ids"]
-        # shift for autoregressive modeling
+
+        # Autoregressive shift
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = input_ids[..., 1:].contiguous()
 
-        # token-wise NLL
+        # Token-wise NLL
         loss_fct = CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
         per_token_loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
         ).view(shift_labels.size())
-        # mask padding
+
+        # Padding mask
         mask = shift_labels != IGNORE_INDEX
         per_token_loss = per_token_loss * mask
 
-        # avg NLL per sample = perplexity proxy
-        per_sample_loss = per_token_loss.sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        # Avg NLL per sample
+        per_sample_nll = per_token_loss.sum(dim=1) / mask.sum(dim=1).clamp(min=1)
 
-        # weighting based on threshold
-        log_p0 = torch.log(
-            torch.tensor(finetuning_args.ttl_perplexity_threshold, device=per_sample_loss.device)
-        )
-        indicator = (per_sample_loss > log_p0).float()
-        num_selected = int(indicator.sum().item())
-        total = per_sample_loss.size(0)
-        logger.info_rank0(f"[TTL] Selected {num_selected} / {total} high-perplexity samples.")
-        score_term = (per_sample_loss - log_p0).clamp(max=50)  # e^50 ≈ 5e21
+        # Perplexity = exp(NLL)
+        per_sample_ppl = torch.exp(per_sample_nll.clamp(max=20))  # clamp to avoid overflow
+
+        # Compute selection mask and score
+        ppl_threshold = finetuning_args.ttl_perplexity_threshold  # P₀
+        indicator = (per_sample_ppl > ppl_threshold).float()
+
         selection_score = (
             finetuning_args.ttl_sample_efficiency_scaler
-            * torch.exp(score_term)
+            * (per_sample_ppl / ppl_threshold).clamp(max=1e6)
             * indicator
         ).detach()
 
-        return (selection_score * per_sample_loss).sum() / (selection_score.sum() + 1e-8)
+        # Logging
+        num_selected = int(indicator.sum().item())
+        total = per_sample_ppl.size(0)
+        logger.info_rank0(f"[TTL] Selected {num_selected} / {total} high-perplexity samples.")
+
+        # Final loss = weighted perplexity
+        ttl_loss = (selection_score * per_sample_ppl).sum() / (selection_score.sum() + 1e-8)
+
+        return ttl_loss
 
     # Initialize TTLTrainer with custom loss
     trainer = TTLTrainer(
