@@ -92,10 +92,10 @@ def run_tent(
 
     # Start adaptation (training)
     if training_args.do_train:
-        if not finetuning_args.do_tent_adaptation:
-            logger.warning_rank0(
-                "TENT stage is running, but `--do_tent_adaptation` is not set. "
-                "The trainer will fall back to standard supervised loss.")
+        # if not finetuning_args.do_tent_adaptation:
+        #     logger.warning_rank0(
+        #         "TENT stage is running, but `--do_tent_adaptation` is not set. "
+        #         "The trainer will fall back to standard supervised loss.")
 
         train_result = trainer.train(
             resume_from_checkpoint=training_args.resume_from_checkpoint)

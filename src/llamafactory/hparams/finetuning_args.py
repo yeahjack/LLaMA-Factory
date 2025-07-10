@@ -484,13 +484,17 @@ class FinetuningArguments(
         },
     )
 
-    do_tent_adaptation: bool = field(
-        default=False,
-        metadata={"help": "Whether to perform test-time entropy minimization (TENT) adaptation."}
-    )
+    # do_tent_adaptation: bool = field(
+    #     default=False,
+    #     metadata={"help": "Whether to perform test-time entropy minimization (TENT) adaptation."}
+    # )
     tent_generation_len: int = field(
         default=80,
         metadata={"help": "The number of tokens to generate for TENT entropy calculation."}
+    )
+    eata_entropy_threshold: float = field(
+        default=0.4,
+        metadata={"help": "The threshold E0 for EATA sample selection."}
     )
 
     def __post_init__(self):

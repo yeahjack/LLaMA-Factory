@@ -1,8 +1,8 @@
 {
-    "rouge-1": 13.2753,
-    "rouge-2": 4.5228,
-    "rouge-l": 9.9248,
-    "rouge-Lsum": 11.3732,
-    "bleu": 1.4911,
-    "exact_match": 0.0
+    "rouge-1": 33.8632,
+    "rouge-2": 14.9462,
+    "rouge-l": 25.6745,
+    "rouge-Lsum": 27.9116,
+    "bleu": 5.4911,
+    "exact_match": 2.94
 }

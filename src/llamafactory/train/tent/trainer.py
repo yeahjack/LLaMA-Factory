@@ -42,8 +42,8 @@ class TentTrainer(Seq2SeqTrainer):
         Computes the TENT loss. This method completely replaces the standard
         loss computation when `do_tent_adaptation` is enabled.
         """
-        if not self.finetuning_args.do_tent_adaptation:
-            return super().compute_loss(model, inputs, return_outputs)
+        # if not self.finetuning_args.do_tent_adaptation:
+        #     return super().compute_loss(model, inputs, return_outputs)
 
         # --- TENT Adaptation Logic (Self-Contained) ---
 
