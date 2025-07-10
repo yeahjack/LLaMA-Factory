@@ -1,0 +1,67 @@
+{
+  "builder_name": "json",
+  "citation": "",
+  "config_name": "default",
+  "dataset_name": "json",
+  "dataset_size": 1071798,
+  "description": "",
+  "download_checksums": {
+    "/home/yijiexu/LLaMA-Factory/data/agriculture/test.json": {
+      "num_bytes": 1328442,
+      "checksum": null
+    }
+  },
+  "download_size": 1328442,
+  "features": {
+    "input_ids": {
+      "feature": {
+        "dtype": "int32",
+        "_type": "Value"
+      },
+      "_type": "Sequence"
+    },
+    "attention_mask": {
+      "feature": {
+        "dtype": "int8",
+        "_type": "Value"
+      },
+      "_type": "Sequence"
+    },
+    "labels": {
+      "feature": {
+        "dtype": "int64",
+        "_type": "Value"
+      },
+      "_type": "Sequence"
+    },
+    "images": {
+      "dtype": "null",
+      "_type": "Value"
+    },
+    "videos": {
+      "dtype": "null",
+      "_type": "Value"
+    },
+    "audios": {
+      "dtype": "null",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 2400240,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 1071798,
+      "num_examples": 5000,
+      "dataset_name": "json"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}

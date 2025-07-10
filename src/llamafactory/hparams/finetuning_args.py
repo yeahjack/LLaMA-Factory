@@ -15,6 +15,8 @@
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional
 
+import math
+
 
 @dataclass
 class FreezeArguments:
@@ -455,6 +457,40 @@ class FinetuningArguments(
     include_effective_tokens_per_second: bool = field(
         default=False,
         metadata={"help": "Whether or not to compute effective tokens per second."},
+    )
+    ttl_threshold: float = field(
+    default=math.exp(1),
+    metadata={"help": "Default perplexity threshold for TTL. Can be overridden by user."},
+)
+
+    ttl_sample_efficiency_scaler: float = field(
+        default=0.1,
+        metadata={"help": "Scaling factor for TTL sample efficiency. Can be overridden by user."},
+    )
+
+    ttl_loss: str = field(
+        default="ppl_ppl_sum",
+        metadata={
+            "help": (
+                "Loss type used in TTL. Format: <selection>_<aggregation>_<reduction>, where:\n"
+                "- selection ∈ {ppl, nll}: defines how high-difficulty samples are selected\n"
+                "- aggregation ∈ {ppl, nll}: defines which metric to weight\n"
+                "- reduction ∈ {mean, sum}: defines final reduction strategy\n"
+                "Examples:\n"
+                "  'ppl_ppl_sum' = ∑(score × PPL)\n"
+                "  'nll_nll_mean' = mean(score × NLL)\n"
+                "  'ppl_nll_sum' = ∑(score × NLL) with selection based on PPL\n"
+            )
+        },
+    )
+
+    do_tent_adaptation: bool = field(
+        default=False,
+        metadata={"help": "Whether to perform test-time entropy minimization (TENT) adaptation."}
+    )
+    tent_generation_len: int = field(
+        default=80,
+        metadata={"help": "The number of tokens to generate for TENT entropy calculation."}
     )
 
     def __post_init__(self):

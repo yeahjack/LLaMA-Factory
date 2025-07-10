@@ -25,6 +25,7 @@ from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push
 from .trainer import TTLTrainer
 
+import math
 
 if TYPE_CHECKING:
     from transformers import Seq2SeqTrainingArguments, TrainerCallback
@@ -57,11 +58,9 @@ def run_ttl(
         **tokenizer_module,
     )
 
-    finetuning_args.ttl_perplexity_threshold = 20.086 # Default threshold for TTL, can be overridden by user, current value is e**3
-    finetuning_args.ttl_sample_efficiency_scaler = 0.1  # Default scaling factor for TTL, can be overridden by user
-
     # Load model
-    model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
+    model = load_model(tokenizer, model_args, finetuning_args,
+                       training_args.do_train)
     if getattr(model, "is_quantized", False) and not training_args.do_train:
         setattr(model, "_hf_peft_config_loaded", True)
 
@@ -70,69 +69,111 @@ def run_ttl(
         template=template,
         model=model,
         pad_to_multiple_of=8 if training_args.do_train else None,
-        label_pad_token_id=(IGNORE_INDEX if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id),
+        label_pad_token_id=(IGNORE_INDEX if data_args.ignore_pad_token_for_loss
+                            else tokenizer.pad_token_id),
         block_diag_attn=model_args.block_diag_attn,
-        attn_implementation=getattr(model.config, "_attn_implementation", None),
+        attn_implementation=getattr(model.config, "_attn_implementation",
+                                    None),
         compute_dtype=model_args.compute_dtype,
         **tokenizer_module,
     )
 
     # Disable generation
     if training_args.predict_with_generate:
-        logger.warning_once("`predict_with_generate` is not supported in TTL stage.")
+        logger.warning_once(
+            "`predict_with_generate` is not supported in TTL stage.")
         training_args.predict_with_generate = False
 
     # Monkey-patch forward to include input_ids in outputs
     orig_forward = model.forward
+
     def forward_with_ids(*args, input_ids=None, attention_mask=None, **kwargs):
-        outputs = orig_forward(*args, input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+        outputs = orig_forward(*args,
+                               input_ids=input_ids,
+                               attention_mask=attention_mask,
+                               **kwargs)
         outputs["input_ids"] = input_ids
         return outputs
+
     model.forward = forward_with_ids
 
-    # Define TTL loss function matching signature (outputs, labels, num_items_in_batch)
     def compute_ttl_loss(outputs, labels, num_items_in_batch=None):
+        """
+        Compute TTL loss with a flexible three-segment spec:
+            "<selection_form>_<later_form>_<mean|sum>"
+
+        selection_form ∈ {"ppl", "nll"}
+        later_form     ∈ {"ppl", "nll"}
+        mean|sum       ∈ {"mean", "sum"}
+        """
         logits = outputs["logits"]
         input_ids = outputs["input_ids"]
 
-        # Autoregressive shift
+        # -------- NLL / PPL per sample -----------------------------------------
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = input_ids[..., 1:].contiguous()
 
-        # Token-wise NLL
-        loss_fct = CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
+        loss_fct = CrossEntropyLoss(reduction="none",
+                                    ignore_index=IGNORE_INDEX)
         per_token_loss = loss_fct(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
         ).view(shift_labels.size())
 
-        # Padding mask
         mask = shift_labels != IGNORE_INDEX
         per_token_loss = per_token_loss * mask
 
-        # Avg NLL per sample
-        per_sample_nll = per_token_loss.sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        per_sample_nll = per_token_loss.sum(dim=1) / mask.sum(dim=1).clamp(
+            min=1)
+        per_sample_ppl = torch.exp(per_sample_nll.clamp(max=20))  # 防止 overflow
 
-        # Perplexity = exp(NLL)
-        per_sample_ppl = torch.exp(per_sample_nll.clamp(max=20))  # clamp to avoid overflow
+        # -------- 三段式配置解析 -------------------------------------------------
+        ttl_loss_type = getattr(finetuning_args, "ttl_loss", "ppl_ppl_sum")
+        try:
+            selection_form, later_form, reduction = ttl_loss_type.split("_")
+        except ValueError:
+            raise ValueError(
+                f"ttl_loss 必须形如 '<selection>_<later>_<mean|sum>'，收到: {ttl_loss_type}"
+            )
 
-        # Compute selection mask and score
-        ppl_threshold = finetuning_args.ttl_perplexity_threshold  # P₀
-        indicator = (per_sample_ppl > ppl_threshold).float()
+        if selection_form not in {"ppl", "nll"}:
+            raise ValueError(f"Unsupported selection_form: {selection_form}")
+        if later_form not in {"ppl", "nll"}:
+            raise ValueError(f"Unsupported later_form: {later_form}")
+        if reduction not in {"mean", "sum"}:
+            raise ValueError(f"Unsupported reduction: {reduction}")
 
-        selection_score = (
-            finetuning_args.ttl_sample_efficiency_scaler
-            * (per_sample_ppl / ppl_threshold).clamp(max=1e6)
-            * indicator
-        ).detach()
+        # -------- 选样分数 -------------------------------------------------------
+        scaler = finetuning_args.ttl_sample_efficiency_scaler
+        base_threshold = finetuning_args.ttl_threshold
 
-        # Logging
+        if selection_form == "ppl":
+            ppl_threshold = math.exp(base_threshold)
+            indicator = (per_sample_ppl > ppl_threshold).float()
+            selection_score = (
+                scaler * (per_sample_ppl / ppl_threshold).clamp(max=1e6) *
+                indicator).detach()
+        else:  # "nll"
+            nll_threshold = base_threshold
+            indicator = (per_sample_nll > nll_threshold).float()
+            selection_score = (
+                scaler * (per_sample_nll / nll_threshold).clamp(max=1e6) *
+                indicator).detach()
+
+        # 日志保持原格式
         num_selected = int(indicator.sum().item())
         total = per_sample_ppl.size(0)
-        logger.info_rank0(f"[TTL] Selected {num_selected} / {total} high-perplexity samples.")
+        logger.info_rank0(
+            f"[TTL] Selected {num_selected} / {total} high-perplexity samples."
+        )
 
-        # Final loss = weighted perplexity
-        ttl_loss = (selection_score * per_sample_ppl).sum() / (selection_score.sum() + 1e-8)
+        # -------- 聚合 -----------------------------------------------------------
+        per_sample_metric = per_sample_ppl if later_form == "ppl" else per_sample_nll
+        # ttl_loss = (selection_score * per_sample_metric).sum()
+        if reduction == 'mean':
+            ttl_loss = (selection_score * per_sample_metric).sum() / (selection_score.sum())
+        elif reduction == 'sum':
+            ttl_loss = (selection_score * per_sample_metric).sum()
 
         return ttl_loss
 
@@ -151,7 +192,8 @@ def run_ttl(
 
     # Training
     if training_args.do_train:
-        train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+        train_result = trainer.train(
+            resume_from_checkpoint=training_args.resume_from_checkpoint)
         trainer.save_model()
         trainer.log_metrics("train", train_result.metrics)
         trainer.save_metrics("train", train_result.metrics)
@@ -166,4 +208,5 @@ def run_ttl(
         trainer.save_metrics("eval", metrics)
 
     # Create model card and push
-    create_modelcard_and_push(trainer, model_args, data_args, training_args, finetuning_args)
+    create_modelcard_and_push(trainer, model_args, data_args, training_args,
+                              finetuning_args)

@@ -35,6 +35,7 @@ from .pt import run_pt
 from .rm import run_rm
 from .sft import run_sft
 from .ttl import run_ttl
+from .tent import run_tent
 from .trainer_utils import get_ray_trainer, get_swanlab_callback
 
 
@@ -81,6 +82,8 @@ def _training_function(config: dict[str, Any]) -> None:
         run_kto(model_args, data_args, training_args, finetuning_args, callbacks)
     elif finetuning_args.stage == "ttl":
         run_ttl(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
+    elif finetuning_args.stage == "tent":
+        run_tent(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
     else:
         raise ValueError(f"Unknown task: {finetuning_args.stage}.")
 
