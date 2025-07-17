@@ -488,13 +488,47 @@ class FinetuningArguments(
     #     default=False,
     #     metadata={"help": "Whether to perform test-time entropy minimization (TENT) adaptation."}
     # )
-    tent_generation_len: int = field(
+    generation_len: int = field(
         default=80,
-        metadata={"help": "The number of tokens to generate for TENT entropy calculation."}
+        metadata={"help": "The number of tokens to generate for entropy calculation."}
+    )
+    use_full_entropy_in_generation: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, use the full sequence (prompt + generated tokens) "
+                "to compute entropy when generation_len > 0. "
+                "If False, use only the generated part."
+            )
+        },
     )
     eata_entropy_threshold: float = field(
         default=0.4,
-        metadata={"help": "The threshold E0 for EATA sample selection."}
+        metadata={"help": "Entropy threshold E₀ for EATA sample selection (S_ent)."}
+    )
+    eata_select_high_entropy: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, inverts the EATA sample selection logic to select and optimize "
+                "samples with entropy *higher* than the threshold (E₀), "
+                "instead of the default low-entropy samples."
+            )
+        },
+    )
+    eata_use_sdiv: bool = field(
+        default=False,
+        metadata={"help": "Whether to use the S_div(x) diversity filtering in EATA."}
+    )
+
+    eata_sdiv_threshold: float = field(
+        default=0.4,
+        metadata={"help": "Cosine similarity threshold ε for S_div(x). Lower means stricter diversity."}
+    )
+
+    eata_sdiv_momentum: float = field(
+        default=0.1,
+        metadata={"help": "EMA momentum for updating the moving average of sample logits in S_div(x)."}
     )
 
     def __post_init__(self):

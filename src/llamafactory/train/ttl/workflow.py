@@ -171,7 +171,8 @@ def run_ttl(
         per_sample_metric = per_sample_ppl if later_form == "ppl" else per_sample_nll
         # ttl_loss = (selection_score * per_sample_metric).sum()
         if reduction == 'mean':
-            ttl_loss = (selection_score * per_sample_metric).sum() / (selection_score.sum())
+            #ttl_loss = (selection_score * per_sample_metric).sum() / (selection_score.sum())
+            ttl_loss = (per_sample_metric).sum()
         elif reduction == 'sum':
             ttl_loss = (selection_score * per_sample_metric).sum()
 

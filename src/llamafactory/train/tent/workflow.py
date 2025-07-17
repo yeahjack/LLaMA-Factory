@@ -9,6 +9,8 @@ from ...extras.ploting import plot_loss
 from ...model import load_model, load_tokenizer
 from ..trainer_utils import create_modelcard_and_push
 from .trainer import TentTrainer  # <-- Import the self-contained trainer
+import os
+import json
 
 if TYPE_CHECKING:
     from transformers import Seq2SeqTrainingArguments, TrainerCallback
@@ -103,6 +105,41 @@ def run_tent(
         trainer.log_metrics("train", train_result.metrics)
         trainer.save_metrics("train", train_result.metrics)
         trainer.save_state()
+
+        # 后处理和保存
+        if trainer.is_world_process_zero():
+            # 检查是否有收集到的原始日志数据
+            if hasattr(trainer, "token_log") and trainer.token_log:
+                logger.info("Post-processing token logs to generate entropy details...")
+
+                final_log = []
+                # 遍历每个批次的原始数据 (tokens, entropies, mask)
+                for batch_tokens, batch_entropies, batch_mask in trainer.token_log:
+                    # 遍历批次中的每个样本
+                    for i in range(batch_tokens.size(0)):
+                        sample_details = []
+                        # 遍历序列中的每个 token
+                        for j in range(batch_tokens.size(1)):
+                            if batch_mask[i, j]:  # 如果是有效 token (非填充)
+                                token_id = batch_tokens[i, j].item()
+                                token_str = tokenizer.decode(token_id)
+                                entropy_val = batch_entropies[i, j].item()
+                                sample_details.append({"token": token_str, "entropy": round(entropy_val, 4)})
+                        
+                        if sample_details:
+                            final_log.append(sample_details)
+
+                output_file = os.path.join(training_args.output_dir, "token_entropy_details.json")
+                logger.info(f"Saving processed token-entropy details for {len(final_log)} samples...")
+                try:
+                    with open(output_file, "w", encoding="utf-8") as f:
+                        json.dump(final_log, f, indent=2, ensure_ascii=False)
+                    logger.info(f"Token-entropy details successfully saved to {output_file}")
+                except Exception as e:
+                    logger.error(f"Failed to save token-entropy details: {e}")
+            else:
+                logger.warning("No raw token logs were collected, skipping save.")
+
         if trainer.is_world_process_zero() and finetuning_args.plot_loss:
             plot_loss(training_args.output_dir, keys=["loss", "eval_loss"])
 

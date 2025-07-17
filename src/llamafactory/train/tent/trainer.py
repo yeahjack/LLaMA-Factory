@@ -4,7 +4,7 @@ import torch
 from transformers import Seq2SeqTrainer
 from transformers.modeling_outputs import CausalLMOutput
 from typing_extensions import override
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
 
 from ...extras.logging import get_logger
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
@@ -34,63 +34,82 @@ class TentTrainer(Seq2SeqTrainer):
     ):
         super().__init__(*args, **kwargs)
         self.finetuning_args = finetuning_args
-
+        self.token_log: List[List[Dict[str, Union[str,
+                                                  float]]]] = []  # noqa: F821
 
     @override
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        r"""
-        Computes the TENT loss. This method completely replaces the standard
-        loss computation when `do_tent_adaptation` is enabled.
-        """
-        # if not self.finetuning_args.do_tent_adaptation:
-        #     return super().compute_loss(model, inputs, return_outputs)
-
-        # --- TENT Adaptation Logic (Self-Contained) ---
-
-        # Step 1: Generate output tokens in evaluation mode (no dropout).
-        # This step does not compute gradients.
+    def compute_loss(self,
+                     model,
+                     inputs,
+                     return_outputs=False,
+                     num_items_in_batch=None):
         self.model.eval()
         with torch.no_grad():
-            generated_tokens = self.model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                max_new_tokens=self.finetuning_args.tent_generation_len,
-                pad_token_id=self.processing_class.pad_token_id,
-                eos_token_id=self.processing_class.eos_token_id,
-                do_sample=False,
-                top_k=None,  # Ensure deterministic generation
-                top_p=None,
-                temperature=1.0,  # No temperature scaling for TENT
-            )
-        self.model.train()  # IMPORTANT: Switch back to training mode for gradient computation
+            if self.finetuning_args.generation_len > 0:
+                # Step 1a: Generate tokens (no gradient)
+                generated_tokens = self.model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    max_new_tokens=self.finetuning_args.generation_len,
+                    pad_token_id=self.processing_class.pad_token_id,
+                    eos_token_id=self.processing_class.eos_token_id,
+                    do_sample=False,
+                    top_k=None,
+                    top_p=None,
+                    temperature=1.0,
+                )
+                prompt_len = inputs["input_ids"].size(1)
+            else:
+                # Step 1b: Skip generation; use input directly
+                generated_tokens = inputs["input_ids"]
+                prompt_len = 0  # full sequence used
 
-        # Step 2: Get logits for the generated tokens.
-        # This forward pass WILL compute gradients.
+        self.model.train()  # Restore training mode
+
+        # Step 2: Forward pass with gradient tracking
         outputs: CausalLMOutput = self.model(input_ids=generated_tokens)
-        logits = outputs.logits
+        logits = outputs.logits  # [B, T, V]
 
-        # Step 3: Isolate logits and tokens corresponding to the generated part.
-        prompt_len = inputs["input_ids"].size(1)
-        gen_logits = logits[:, prompt_len - 1:-1, :]
-        gen_tokens = generated_tokens[:, prompt_len:]
+        # Step 3: Slice logits/tokens based on generation mode
+        if self.finetuning_args.generation_len > 0:
+            if getattr(self.finetuning_args, "use_full_entropy_in_generation", False):
+                # 使用整个序列 entropy
+                gen_logits = logits[:, :-1, :]
+                gen_tokens = generated_tokens[:, 1:]
+            else:
+                # 使用生成部分 entropy（默认逻辑）
+                gen_logits = logits[:, prompt_len - 1:-1, :]
+                gen_tokens = generated_tokens[:, prompt_len:]
+        else:
+            gen_logits = logits[:, :-1, :]
+            gen_tokens = generated_tokens[:, 1:]
 
-        # Step 4: Calculate token-wise entropy from logits.
+        # Step 4: Compute entropy
         probs = torch.nn.functional.softmax(gen_logits, dim=-1)
         log_probs = torch.nn.functional.log_softmax(gen_logits, dim=-1)
-        entropy = -torch.sum(probs * log_probs, dim=-1)
+        entropy = -torch.sum(probs * log_probs, dim=-1)  # [B, L]
 
-        # Step 5: Mask out padding tokens and compute the final mean entropy loss.
-        entropy_mask = (gen_tokens != self.processing_class.pad_token_id).float()
+        # Step 5: Mask padding
+        entropy_mask = (gen_tokens
+                        != self.processing_class.pad_token_id).float()
         loss = (entropy * entropy_mask).sum() / (entropy_mask.sum() + 1e-8)
 
-        # The base class expects a tuple if return_outputs is True.
-        # For TENT, the "outputs" are the ones from the second forward pass.
+        if self.is_in_train and gen_tokens.numel() > 0:
+            # 将一个批次的 tokens, entropies, 和 mask 作为一个元组存储
+            # .detach().cpu() 是关键：分离计算图并移至CPU，以防GPU内存泄漏
+            self.token_log.append((
+                gen_tokens.detach().cpu(),
+                entropy.detach().cpu(),
+                entropy_mask.detach().cpu().bool(),  # 使用 bool mask 更高效
+            ))
+
         return (loss, outputs) if return_outputs else loss
 
     @override
     def create_optimizer(self):
         if self.optimizer is None:
-            self.optimizer = create_custom_optimizer(self.model, self.args, self.finetuning_args)
+            self.optimizer = create_custom_optimizer(self.model, self.args,
+                                                     self.finetuning_args)
         return super().create_optimizer()
 
     @override
