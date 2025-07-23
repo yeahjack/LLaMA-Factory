@@ -33,11 +33,7 @@ class EataTrainer(Seq2SeqTrainer):
         self.token_log: List[List[Dict[str, Union[str, float]]]] = []
 
     @override
-    def compute_loss(self,
-                     model,
-                     inputs,
-                     return_outputs=False,
-                     num_items_in_batch=None):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Step 1: Generate output tokens
         self.model.eval()
         with torch.no_grad():
@@ -63,12 +59,13 @@ class EataTrainer(Seq2SeqTrainer):
 
         # Step 3: Get logits and tokens for loss calculation
         if self.finetuning_args.generation_len > 0 and getattr(
-                self.finetuning_args, "use_full_entropy_in_generation", False):
+            self.finetuning_args, "use_full_entropy_in_generation", False
+        ):
             target_logits = logits[:, :-1, :]  # [B, L_full-1, V]
             target_tokens = generated_tokens[:, 1:]  # [B, L_full-1]
         else:
             prompt_len = inputs["input_ids"].size(1)
-            target_logits = logits[:, prompt_len - 1:-1, :]  # [B, L_gen, V]
+            target_logits = logits[:, prompt_len - 1 : -1, :]  # [B, L_gen, V]
             target_tokens = generated_tokens[:, prompt_len:]  # [B, L_gen]
 
         # Step 4: Token-wise entropy
@@ -77,18 +74,17 @@ class EataTrainer(Seq2SeqTrainer):
         entropy = -torch.sum(probs * log_probs, dim=-1)  # [B, L]
 
         # Step 5: Mask padding and compute sequence-level entropy
-        entropy_mask = (
-            target_tokens
-            != self.processing_class.pad_token_id).float()  # [B, L]
-        token_entropy = (entropy * entropy_mask).sum(dim=-1) / (
-            entropy_mask.sum(dim=-1) + 1e-8)  # [B]
+        entropy_mask = (target_tokens != self.processing_class.pad_token_id).float()  # [B, L]
+        token_entropy = (entropy * entropy_mask).sum(dim=-1) / (entropy_mask.sum(dim=-1) + 1e-8)  # [B]
 
         if self.is_in_train and target_tokens.numel() > 0:
-            self.token_log.append((
-                target_tokens.detach().cpu(),
-                entropy.detach().cpu(),
-                entropy_mask.detach().cpu().bool(),
-            ))
+            self.token_log.append(
+                (
+                    target_tokens.detach().cpu(),
+                    entropy.detach().cpu(),
+                    entropy_mask.detach().cpu().bool(),
+                )
+            )
 
         # Step 6: EATA Sample Selection (S_ent)
         E0 = getattr(self.finetuning_args, "eata_entropy_threshold", 0.4)
@@ -113,15 +109,11 @@ class EataTrainer(Seq2SeqTrainer):
             if self.eata_mt is None:
                 self.eata_mt = avg_probs.mean(dim=0).detach()
             else:
-                alpha = getattr(self.finetuning_args, "eata_sdiv_momentum",
-                                0.1)
-                self.eata_mt = alpha * avg_probs.mean(
-                    dim=0).detach() + (1 - alpha) * self.eata_mt
+                alpha = getattr(self.finetuning_args, "eata_sdiv_momentum", 0.1)
+                self.eata_mt = alpha * avg_probs.mean(dim=0).detach() + (1 - alpha) * self.eata_mt
 
-            cos_sim = torch.nn.functional.cosine_similarity(
-                avg_probs, self.eata_mt.unsqueeze(0), dim=1)  # [B]
-            sdiv_thresh = getattr(self.finetuning_args, "eata_sdiv_threshold",
-                                  0.4)
+            cos_sim = torch.nn.functional.cosine_similarity(avg_probs, self.eata_mt.unsqueeze(0), dim=1)  # [B]
+            sdiv_thresh = getattr(self.finetuning_args, "eata_sdiv_threshold", 0.4)
             sdiv_mask = (cos_sim < sdiv_thresh).float()  # [B]
 
             sent_score = (sent_score * sdiv_mask).detach()
@@ -129,19 +121,18 @@ class EataTrainer(Seq2SeqTrainer):
         # Step 8: Final weighted entropy loss
         entropy = entropy.view(entropy.size(0), -1)
         entropy_mask = entropy_mask.view(entropy_mask.size(0), -1)
-        sent_score_expanded = sent_score.unsqueeze(1).expand_as(
-            entropy)  # [B, L]
+        sent_score_expanded = sent_score.unsqueeze(1).expand_as(entropy)  # [B, L]
 
         loss = (entropy * entropy_mask * sent_score_expanded).sum() / (
-            entropy_mask * sent_score_expanded).sum().clamp_min(1e-8)
+            entropy_mask * sent_score_expanded
+        ).sum().clamp_min(1e-8)
 
         return (loss, outputs) if return_outputs else loss
 
     @override
     def create_optimizer(self):
         if self.optimizer is None:
-            self.optimizer = create_custom_optimizer(self.model, self.args,
-                                                     self.finetuning_args)
+            self.optimizer = create_custom_optimizer(self.model, self.args, self.finetuning_args)
         return super().create_optimizer()
 
     @override
@@ -153,5 +144,6 @@ class EataTrainer(Seq2SeqTrainer):
     def _get_train_sampler(self, *args, **kwargs):
         if self.finetuning_args.disable_shuffling:
             import torch as _torch
+
             return _torch.utils.data.SequentialSampler(self.train_dataset)
         return super()._get_train_sampler(*args, **kwargs)

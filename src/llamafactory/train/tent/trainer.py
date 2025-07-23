@@ -34,15 +34,10 @@ class TentTrainer(Seq2SeqTrainer):
     ):
         super().__init__(*args, **kwargs)
         self.finetuning_args = finetuning_args
-        self.token_log: List[List[Dict[str, Union[str,
-                                                  float]]]] = []  # noqa: F821
+        self.token_log: List[List[Dict[str, Union[str, float]]]] = []  # noqa: F821
 
     @override
-    def compute_loss(self,
-                     model,
-                     inputs,
-                     return_outputs=False,
-                     num_items_in_batch=None):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self.model.eval()
         with torch.no_grad():
             if self.finetuning_args.generation_len > 0:
@@ -78,7 +73,7 @@ class TentTrainer(Seq2SeqTrainer):
                 gen_tokens = generated_tokens[:, 1:]
             else:
                 # 使用生成部分 entropy（默认逻辑）
-                gen_logits = logits[:, prompt_len - 1:-1, :]
+                gen_logits = logits[:, prompt_len - 1 : -1, :]
                 gen_tokens = generated_tokens[:, prompt_len:]
         else:
             gen_logits = logits[:, :-1, :]
@@ -90,26 +85,36 @@ class TentTrainer(Seq2SeqTrainer):
         entropy = -torch.sum(probs * log_probs, dim=-1)  # [B, L]
 
         # Step 5: Mask padding
-        entropy_mask = (gen_tokens
-                        != self.processing_class.pad_token_id).float()
-        loss = (entropy * entropy_mask).sum() / (entropy_mask.sum() + 1e-8)
+        entropy_mask = (gen_tokens != self.processing_class.pad_token_id).float()
+
+        # Step 6: Compute loss based on the selected method
+        if getattr(self.finetuning_args, "use_emft_loss", False):
+            # EM-FT Loss: Mean of Path-Total Entropy
+            # First, sum the entropy for each sequence in the batch
+            loss_per_sequence = (entropy * entropy_mask).sum(dim=1)
+            # Then, average these total path entropies
+            loss = loss_per_sequence.mean()
+        else:
+            # TENT Loss (Default): Batch-Average Token Entropy
+            loss = (entropy * entropy_mask).sum() / (entropy_mask.sum() + 1e-8)
 
         if self.is_in_train and gen_tokens.numel() > 0:
             # 将一个批次的 tokens, entropies, 和 mask 作为一个元组存储
             # .detach().cpu() 是关键：分离计算图并移至CPU，以防GPU内存泄漏
-            self.token_log.append((
-                gen_tokens.detach().cpu(),
-                entropy.detach().cpu(),
-                entropy_mask.detach().cpu().bool(),  # 使用 bool mask 更高效
-            ))
+            self.token_log.append(
+                (
+                    gen_tokens.detach().cpu(),
+                    entropy.detach().cpu(),
+                    entropy_mask.detach().cpu().bool(),  # 使用 bool mask 更高效
+                )
+            )
 
         return (loss, outputs) if return_outputs else loss
 
     @override
     def create_optimizer(self):
         if self.optimizer is None:
-            self.optimizer = create_custom_optimizer(self.model, self.args,
-                                                     self.finetuning_args)
+            self.optimizer = create_custom_optimizer(self.model, self.args, self.finetuning_args)
         return super().create_optimizer()
 
     @override
@@ -121,5 +126,6 @@ class TentTrainer(Seq2SeqTrainer):
     def _get_train_sampler(self, *args, **kwargs):
         if self.finetuning_args.disable_shuffling:
             import torch as _torch
+
             return _torch.utils.data.SequentialSampler(self.train_dataset)
         return super()._get_train_sampler(*args, **kwargs)

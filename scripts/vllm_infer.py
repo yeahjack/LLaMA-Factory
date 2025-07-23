@@ -58,6 +58,7 @@ def vllm_infer(
     video_fps: float = 2.0,
     video_maxlen: int = 128,
     batch_size: int = 1024,
+    gpu_memory_utilization: float = 0.90,
 ):
     r"""Perform batch generation using vLLM engine, which supports tensor parallelism.
 
@@ -102,6 +103,7 @@ def vllm_infer(
         "pipeline_parallel_size": pipeline_parallel_size,
         "disable_log_stats": True,
         "enable_lora": model_args.adapter_name_or_path is not None,
+        "gpu_memory_utilization": gpu_memory_utilization,
     }
     if template_obj.mm_plugin.__class__.__name__ != "BasePlugin":
         engine_args["limit_mm_per_prompt"] = {"image": 4, "video": 2, "audio": 2}
@@ -124,6 +126,7 @@ def vllm_infer(
         max_tokens=generating_args.max_new_tokens,
         skip_special_tokens=skip_special_tokens,
         seed=seed,
+        min_tokens=10
     )
     if model_args.adapter_name_or_path is not None:
         lora_request = LoRARequest("default", 1, model_args.adapter_name_or_path[0])

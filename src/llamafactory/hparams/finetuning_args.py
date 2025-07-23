@@ -459,38 +459,31 @@ class FinetuningArguments(
         metadata={"help": "Whether or not to compute effective tokens per second."},
     )
     ttl_threshold: float = field(
-    default=math.exp(1),
-    metadata={"help": "Default perplexity threshold for TTL. Can be overridden by user."},
-)
-
+        default=1,
+        metadata={"help": "Default perplexity threshold for TTL. Can be overridden by user."},
+    )
     ttl_sample_efficiency_scaler: float = field(
         default=0.1,
         metadata={"help": "Scaling factor for TTL sample efficiency. Can be overridden by user."},
     )
-
     ttl_loss: str = field(
-        default="ppl_ppl_sum",
+        default="ppl_ppl",
         metadata={
             "help": (
-                "Loss type used in TTL. Format: <selection>_<aggregation>_<reduction>, where:\n"
-                "- selection ∈ {ppl, nll}: defines how high-difficulty samples are selected\n"
-                "- aggregation ∈ {ppl, nll}: defines which metric to weight\n"
-                "- reduction ∈ {mean, sum}: defines final reduction strategy\n"
+                "Specifies the TTL loss configuration. Format: <metric> or <metric>_<selection>, where:\n"
+                "- metric ∈ {ppl, nll}: the sequence-level objective being optimized (i.e., source of gradients)\n"
+                "- selection ∈ {ppl, nll} (optional): if provided, enables gating to select harder samples based on this metric\n"
                 "Examples:\n"
-                "  'ppl_ppl_sum' = ∑(score × PPL)\n"
-                "  'nll_nll_mean' = mean(score × NLL)\n"
-                "  'ppl_nll_sum' = ∑(score × NLL) with selection based on PPL\n"
+                "  'nll'       → optimize NLL; no sample selection\n"
+                "  'ppl'       → optimize PPL; no selection\n"
+                "  'nll_ppl'   → optimize NLL; select high-PPL samples\n"
+                "  'ppl_nll'   → optimize PPL; select high-NLL samples\n"
+                "  'nll_nll'   → optimize NLL; select high-NLL samples\n"
             )
         },
     )
-
-    # do_tent_adaptation: bool = field(
-    #     default=False,
-    #     metadata={"help": "Whether to perform test-time entropy minimization (TENT) adaptation."}
-    # )
     generation_len: int = field(
-        default=80,
-        metadata={"help": "The number of tokens to generate for entropy calculation."}
+        default=80, metadata={"help": "The number of tokens to generate for entropy calculation."}
     )
     use_full_entropy_in_generation: bool = field(
         default=False,
@@ -502,9 +495,22 @@ class FinetuningArguments(
             )
         },
     )
+    use_emft_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether to use EM-FT's path-total entropy loss instead of TENT's average entropy loss."},
+    )
+    # For Combined Loss
+    loss_weight_ttl: float = field(
+        default=1.0,
+        metadata={"help": "Weight of the TTL loss."},
+    )
+    loss_weight_tent: float = field(
+        default=1.0,
+        metadata={"help": "Weight of the TENT loss."},
+    )
+    # Combined Loss Ended
     eata_entropy_threshold: float = field(
-        default=0.4,
-        metadata={"help": "Entropy threshold E₀ for EATA sample selection (S_ent)."}
+        default=0.4, metadata={"help": "Entropy threshold E₀ for EATA sample selection (S_ent)."}
     )
     eata_select_high_entropy: bool = field(
         default=False,
@@ -517,18 +523,13 @@ class FinetuningArguments(
         },
     )
     eata_use_sdiv: bool = field(
-        default=False,
-        metadata={"help": "Whether to use the S_div(x) diversity filtering in EATA."}
+        default=False, metadata={"help": "Whether to use the S_div(x) diversity filtering in EATA."}
     )
-
     eata_sdiv_threshold: float = field(
-        default=0.4,
-        metadata={"help": "Cosine similarity threshold ε for S_div(x). Lower means stricter diversity."}
+        default=0.4, metadata={"help": "Cosine similarity threshold ε for S_div(x). Lower means stricter diversity."}
     )
-
     eata_sdiv_momentum: float = field(
-        default=0.1,
-        metadata={"help": "EMA momentum for updating the moving average of sample logits in S_div(x)."}
+        default=0.1, metadata={"help": "EMA momentum for updating the moving average of sample logits in S_div(x)."}
     )
 
     def __post_init__(self):

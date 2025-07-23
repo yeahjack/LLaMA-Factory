@@ -181,3 +181,14 @@ data/
 examples/
 results/
 results_*
+*.ipynb
+*.jpg
+*.png
+*.jpeg
+*.json
+*.jinja
+*.sh
+metrics_extra
+*.csv
+coe_dataset.py
+uncertainty*

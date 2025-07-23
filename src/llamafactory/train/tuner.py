@@ -37,6 +37,7 @@ from .sft import run_sft
 from .ttl import run_ttl
 from .tent import run_tent
 from .eata import run_eata
+from .ttltent import run_ttltent
 from .trainer_utils import get_ray_trainer, get_swanlab_callback
 
 
@@ -87,6 +88,8 @@ def _training_function(config: dict[str, Any]) -> None:
         run_tent(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
     elif finetuning_args.stage == "eata":
         run_eata(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
+    elif finetuning_args.stage == "ttltent":
+        run_ttltent(model_args, data_args, training_args, finetuning_args, generating_args, callbacks)
     else:
         raise ValueError(f"Unknown task: {finetuning_args.stage}.")
 
