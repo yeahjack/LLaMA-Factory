@@ -8,6 +8,13 @@ import argparse
 
 
 def _load_metrics_file(fp: Path) -> dict | None:
+    """
+    加载并解析单个JSON或JSONL指标文件。
+    - 兼容大小写不一致的key，全部转为小写处理。
+    - 优先尝试将整个文件作为单个JSON解析。
+    - 如果失败，则尝试逐行解析（JSONL）。
+    - 对于多行JSONL，只返回第一条有效记录。
+    """
     try:
         text = fp.read_text(encoding="utf-8").strip()
         if not text:
@@ -43,7 +50,11 @@ def _load_metrics_file(fp: Path) -> dict | None:
 
 
 def _load_llm_em_from_csv(fp: Path) -> float | None:
-    # ... (此函数无任何变化)
+    """
+    从特定的CSV文件中加载LLM_EM分数。
+    - 查找包含 'match_rate' 和 'is_true_rate' 的列。
+    - 将百分比字符串（如 "95.91%"）转换为浮点数（如 95.91）。
+    """
     try:
         df = pd.read_csv(fp)
         # 清理列名中的空格，以防万一
@@ -59,10 +70,10 @@ def _load_llm_em_from_csv(fp: Path) -> float | None:
         rate_str = df[target_col].iloc[0]
 
         if isinstance(rate_str, str) and rate_str.endswith("%"):
-            # 移除 '%' 并转换为 0-1 之间的小数
+            # 移除 '%' 并转换为浮点数
             return round(float(rate_str.strip("%")), 2)
         else:
-            # 如果值已经是小数形式，直接转换
+            # 如果值已经是小数或数字形式，直接转换
             return float(rate_str)
 
     except Exception as e:
@@ -70,9 +81,9 @@ def _load_llm_em_from_csv(fp: Path) -> float | None:
         return None
 
 
-def analyze_metrics(root_dir: str = "results_no_system") -> pd.DataFrame | None:
+def analyze_metrics(root_dir: str) -> pd.DataFrame | None:
     """
-    扫描目录，解析指标文件（JSON/JSONL/CSV），并返回一个DataFrame。
+    扫描指定根目录，解析所有指标文件（JSON/JSONL/CSV），并将结果整合到一个DataFrame中。
     """
     root_path = Path(root_dir)
     if not root_path.is_dir():
@@ -81,7 +92,7 @@ def analyze_metrics(root_dir: str = "results_no_system") -> pd.DataFrame | None:
 
     records_dict = {}
 
-    # --- 数据加载部分无变化 ---
+    # 遍历并解析所有 *_metrics.json 或 *_metrics.jsonl 文件
     for fp in root_path.rglob("*_metrics.json*"):
         parts = fp.relative_to(root_path).parts
         if len(parts) == 3:
@@ -101,6 +112,7 @@ def analyze_metrics(root_dir: str = "results_no_system") -> pd.DataFrame | None:
             records_dict[rec_key] = {"setting": setting, "benchmark": benchmark, "dataset": dataset}
         records_dict[rec_key].update(metrics)
 
+    # 遍历并解析所有 *_LLM_EM_summary.csv 文件
     for fp in root_path.rglob("*_LLM_EM_summary.csv"):
         parts = fp.relative_to(root_path).parts
         if len(parts) == 3:
@@ -118,6 +130,7 @@ def analyze_metrics(root_dir: str = "results_no_system") -> pd.DataFrame | None:
         if rec_key in records_dict:
             records_dict[rec_key]["llm_em"] = llm_em_score
         else:
+            # 如果一个CSV文件没有对应的JSON指标文件，也为它创建一条记录
             records_dict[rec_key] = {
                 "setting": setting,
                 "benchmark": benchmark,
@@ -132,16 +145,17 @@ def analyze_metrics(root_dir: str = "results_no_system") -> pd.DataFrame | None:
 
     records = list(records_dict.values())
 
-    # 【关键修改点 1】: 更改 set_index 的列顺序以创建正确的 MultiIndex 层次结构
+    # 创建DataFrame并设置多级索引，以实现期望的层次化展示
     df = pd.DataFrame(records).set_index(["benchmark", "dataset", "setting"])
 
-    # 排序以确保分组正确
+    # 排序索引以确保分组正确且显示有序
     df = df.sort_index()
 
-    # 将所有非数值列转换为数值，无法转换的设为NaN
+    # 将所有非数值列转换为数值，无法转换的设为NaN，便于后续计算
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
+    
+    # 将结果保存到CSV文件，方便查阅
     df.to_csv("result.csv")
     return df
 
@@ -154,6 +168,7 @@ def display_filtered_results(
 ):
     """
     根据指定的筛选条件，在控制台打印格式化的DataFrame。
+    - 筛选结果会自动包含'base'方法，以便于进行对比。
     """
     if df is None or df.empty:
         print("输入的DataFrame为空，无法进行筛选和显示。")
@@ -180,7 +195,7 @@ def display_filtered_results(
     filtered_df = temp_df.copy()
     if setting_pattern:
         try:
-            # 确保不筛选掉 'base' 方法
+            # 筛选时，除了匹配正则表达式的，还要始终包含 'base' 方法
             is_base = filtered_df["setting"] == "base"
             matches_pattern = filtered_df["setting"].str.match(setting_pattern, na=False)
             filtered_df = filtered_df[is_base | matches_pattern]
@@ -196,6 +211,9 @@ def display_filtered_results(
         print("\n根据您的筛选条件，没有找到任何匹配的数据。")
         return
 
+    # 为了确保'base'方法能够正确地与筛选出的结果对齐，
+    # 我们需要找到筛选结果涉及的所有benchmark和dataset，
+    # 然后从原始数据中把这些相关的'base'行取出来。
     related_benchmarks = filtered_df["benchmark"].unique()
     related_datasets = filtered_df["dataset"].unique()
 
@@ -205,9 +223,10 @@ def display_filtered_results(
         & (temp_df["dataset"].isin(related_datasets))
     ]
 
+    # 合并筛选出的行和相关的'base'行，并去重
     final_df_rows = pd.concat([base_to_display, filtered_df]).drop_duplicates()
 
-    # 【关键修改点 2】: 使用与默认显示完全相同的索引结构
+    # 重建与默认显示完全相同的索引结构
     display_df = final_df_rows.set_index(["benchmark", "dataset", "setting"])
 
     # 排序以匹配默认的显示格式
@@ -228,10 +247,17 @@ def display_filtered_results(
 
 
 if __name__ == "__main__":
-    # ... (命令行解析部分无任何变化)
     parser = argparse.ArgumentParser(
         description="分析模型性能指标并根据条件筛选结果。", formatter_class=argparse.RawTextHelpFormatter
     )
+    # --- 新增的参数 ---
+    parser.add_argument(
+        "-r",
+        "--root-dir",
+        type=str,
+        help="指定要分析的根目录。\n如果未提供，将默认使用脚本所在目录的父目录下的 'results' 文件夹。",
+    )
+    # --- 保留原有参数 ---
     parser.add_argument(
         "-s",
         "--setting-pattern",
@@ -254,10 +280,17 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    try:
-        root_dir = Path(__file__).resolve().parent.parent / "results"
-    except NameError:
-        root_dir = Path("./results").resolve()
+    # --- 根据参数确定根目录 ---
+    if args.root_dir:
+        root_dir = Path(args.root_dir).resolve()
+    else:
+        # 如果未指定 --root-dir，则使用原始的默认逻辑
+        try:
+            # 适用于标准脚本执行
+            root_dir = Path(__file__).resolve().parent.parent / "results"
+        except NameError:
+            # 适用于在交互式环境（如Jupyter）中运行
+            root_dir = Path("./results").resolve()
 
     print(f"--- 开始分析目录: {root_dir} ---")
 

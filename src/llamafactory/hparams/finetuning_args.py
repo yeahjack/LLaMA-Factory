@@ -531,6 +531,39 @@ class FinetuningArguments(
     eata_sdiv_momentum: float = field(
         default=0.1, metadata={"help": "EMA momentum for updating the moving average of sample logits in S_div(x)."}
     )
+    # Loss Balancing Configuration
+    loss_balancing_method: str = field(
+        default="static",
+        metadata={
+            "help": (
+                "Method for balancing multiple losses. Choices: "
+                "['static', 'dynamic_weight', 'gradient_magnitude', 'uncertainty', 'moving_average', 'adaptive_scaling']. "
+                "'static' uses fixed weights, 'gradient_magnitude' is recommended for automatic balancing."
+            )
+        },
+    )
+    alternating_training: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to use alternating training mode. If True, odd steps optimize TTL (perplexity), "
+                "even steps optimize TENT (entropy). If False, both losses are optimized simultaneously."
+            )
+        },
+    )
+    use_kl_regularization: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to add KL divergence regularization to prevent the model from deviating "
+                "too much from its original parameters during test-time adaptation."
+            )
+        },
+    )
+    kl_weight: float = field(
+        default=0.1,
+        metadata={"help": "Weight for KL regularization loss. Only effective when use_kl_regularization=True."},
+    )
 
     def __post_init__(self):
         def split_arg(arg):

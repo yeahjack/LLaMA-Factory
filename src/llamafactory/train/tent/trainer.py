@@ -1,4 +1,4 @@
-# src/llmtuner/train/tent/trainer.py
+# src/llamafactory/train/tent/trainer.py
 
 import torch
 from transformers import Seq2SeqTrainer
@@ -40,12 +40,22 @@ class TentTrainer(Seq2SeqTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self.model.eval()
         with torch.no_grad():
-            if self.finetuning_args.generation_len > 0:
+            # We generate if generation_len is not zero.
+            if self.finetuning_args.generation_len != 0:
+                # Determine max_new_tokens based on the value of generation_len
+                if self.finetuning_args.generation_len == -1:
+                    # For dynamic generation, set a large upper bound.
+                    # The model will stop early when it generates an EOS token.
+                    max_tokens = 2048  # A sufficiently large number
+                else:
+                    # For fixed-length generation
+                    max_tokens = self.finetuning_args.generation_len
+
                 # Step 1a: Generate tokens (no gradient)
                 generated_tokens = self.model.generate(
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
-                    max_new_tokens=self.finetuning_args.generation_len,
+                    max_new_tokens=max_tokens, # Use the determined max_tokens
                     pad_token_id=self.processing_class.pad_token_id,
                     eos_token_id=self.processing_class.eos_token_id,
                     do_sample=False,
@@ -54,7 +64,7 @@ class TentTrainer(Seq2SeqTrainer):
                     temperature=1.0,
                 )
                 prompt_len = inputs["input_ids"].size(1)
-            else:
+            else: # This block now exclusively handles generation_len == 0
                 # Step 1b: Skip generation; use input directly
                 generated_tokens = inputs["input_ids"]
                 prompt_len = 0  # full sequence used
@@ -66,7 +76,7 @@ class TentTrainer(Seq2SeqTrainer):
         logits = outputs.logits  # [B, T, V]
 
         # Step 3: Slice logits/tokens based on generation mode
-        if self.finetuning_args.generation_len > 0:
+        if self.finetuning_args.generation_len != 0: # MODIFICATION: Condition changed from > 0 to != 0
             if getattr(self.finetuning_args, "use_full_entropy_in_generation", False):
                 # 使用整个序列 entropy
                 gen_logits = logits[:, :-1, :]

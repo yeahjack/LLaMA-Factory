@@ -122,7 +122,11 @@ def run_ttltent(
         logger.info_rank0(f"  TTL Loss: {getattr(finetuning_args, 'ttl_loss', 'nll')}")
         logger.info_rank0(f"  TTL Weight: {getattr(finetuning_args, 'loss_weight_ttl', 1.0)}")
         logger.info_rank0(f"  TENT Weight: {getattr(finetuning_args, 'loss_weight_tent', 1.0)}")
+        logger.info_rank0(f"  KL Weight: {getattr(finetuning_args, 'kl_weight', 0.1)}")
         logger.info_rank0(f"  Generation Length: {getattr(finetuning_args, 'generation_len', 0)}")
+        logger.info_rank0(f"  Loss Balancing Method: {getattr(finetuning_args, 'loss_balancing_method', 'static')}")
+        logger.info_rank0(f"  Alternating Training: {getattr(finetuning_args, 'alternating_training', False)}")
+        logger.info_rank0(f"  KL Regularization: {getattr(finetuning_args, 'use_kl_regularization', False)}")
 
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         trainer.save_model()
@@ -197,6 +201,7 @@ def run_ttltent(
                     loss_data = {
                         "ttl_loss": trainer._custom_losses.get("ttl_loss", []),
                         "tent_loss": trainer._custom_losses.get("tent_loss", []),
+                        "kl_loss": trainer._custom_losses.get("kl_loss", []),
                         "steps": list(range(len(trainer._custom_losses.get("ttl_loss", [])))),
                     }
                     try:
