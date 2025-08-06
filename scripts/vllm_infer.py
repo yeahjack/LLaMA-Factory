@@ -117,16 +117,25 @@ def vllm_infer(
     dataset_module = get_dataset(template_obj, model_args, data_args, training_args, "ppo", **tokenizer_module)
     train_dataset = dataset_module["train_dataset"]
 
+    model_id = model_args.model_name_or_path
+    if "Meta-Llama-3-8B-Instruct" in model_id:
+        stop_ids = [
+            tokenizer.eos_token_id,
+            tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        ]
+    else:
+        stop_ids = template_obj.get_stop_token_ids(tokenizer)
+
     sampling_params = SamplingParams(
-        repetition_penalty=generating_args.repetition_penalty or 1.0,  # repetition_penalty must > 0
+        repetition_penalty=generating_args.repetition_penalty or 1.0,
         temperature=generating_args.temperature,
-        top_p=generating_args.top_p or 1.0,  # top_p must > 0
-        top_k=generating_args.top_k or -1,  # top_k must > 0
-        stop_token_ids=template_obj.get_stop_token_ids(tokenizer),
+        top_p=generating_args.top_p or 1.0,
+        top_k=generating_args.top_k or -1,
+        stop_token_ids=stop_ids,
         max_tokens=generating_args.max_new_tokens,
         skip_special_tokens=skip_special_tokens,
         seed=seed,
-        min_tokens=10
+        min_tokens=10,
     )
     if model_args.adapter_name_or_path is not None:
         lora_request = LoRARequest("default", 1, model_args.adapter_name_or_path[0])
