@@ -328,3 +328,11 @@ def fix_proxy(ipv6_enabled: bool = False) -> None:
     if ipv6_enabled:
         os.environ.pop("http_proxy", None)
         os.environ.pop("HTTP_PROXY", None)
+
+
+def cal_effective_tokens(effective_token_num, epoch, train_runtime) -> int:
+    r"""
+    calculate effective tokens.
+    """
+    result = effective_token_num * epoch / train_runtime
+    return result / dist.get_world_size() if dist.is_initialized() else result

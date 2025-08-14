@@ -15,8 +15,6 @@
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional
 
-import math
-
 
 @dataclass
 class FreezeArguments:
@@ -482,6 +480,21 @@ class FinetuningArguments(
             )
         },
     )
+    # NEW: reference difficulty source for sample selection (minimal addition)
+    ttl_ref_mode: str = field(
+        default="current",
+        metadata={
+            "help": (
+                "Reference source for TTL selection: 'current' (use the current model online) "
+                "or 'precompute_base' (use one-pass precomputed base NLL cache)."
+            )
+        },
+    )
+    # NEW: batch size for one-pass base precomputation (effective when ttl_ref_mode='precompute_base')
+    ttl_ref_batch_size: int = field(
+        default=64,
+        metadata={"help": "Batch size used for one-pass base difficulty precomputation."},
+    )
     generation_len: int = field(
         default=80, metadata={"help": "The number of tokens to generate for entropy calculation."}
     )
@@ -563,6 +576,37 @@ class FinetuningArguments(
     kl_weight: float = field(
         default=0.1,
         metadata={"help": "Weight for KL regularization loss. Only effective when use_kl_regularization=True."},
+    )
+
+    # Official TLM
+    threshold: float = field(
+        default=2.0,
+        metadata={"help": "Masked the samples with the cross-entropy value smaller than this threshold."}
+    )
+
+    lamb: float = field(
+        default=0.1,
+        metadata={"help": "add when computing loss"}
+    )
+
+    setting: str = field(
+        default='offline_ttl',
+        metadata={"help": "the setting to choose"}
+    )
+
+    streaming_batch_size: int = field(
+        default=100,
+        metadata={"help": "The assumed batch size for streaming data when using the online_ttl setting."},
+    )
+
+    enable_ttl_inference: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether to run inference (generate-and-save) during the TTL stage. "
+                "If False, skip inference and only save adapters/LoRA snapshots."
+            )
+        },
     )
 
     def __post_init__(self):

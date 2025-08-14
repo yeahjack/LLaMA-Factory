@@ -928,5 +928,39 @@
       "query": "input",
       "response": "output"
     }
+  },
+  "geosignal_5k": {
+    "file_name": "AdaptEval/geosignal_random_5k.json"
+  },
+  "gen_med_gpt_5k": {
+    "file_name": "AdaptEval/GenMedGPT_random_5k.json"
+  },
+  "agriculture_5k": {
+    "file_name": "AdaptEval/agriculture-qa_random_5k.json",
+    "columns": {
+      "prompt": "question",
+      "response": "answers"
+    }
+  },
+  "wealth_5k": {
+    "file_name": "AdaptEval/wealth-alpaca_lora_random_5k.json"
+  },
+  "alpaca_gpt4_5k": {
+    "file_name": "AdaptEval/alpaca_gpt4_en_random_5k.json"
+  },
+  "instruction_wild_5k": {
+    "file_name": "AdaptEval/instruction_wild_random_5k.json"
+  },
+  "dolly_5k": {
+    "file_name": "AdaptEval/dolly_random_5k.json"
+  },
+  "gsm8k_5k": {
+    "file_name": "AdaptEval/gsm8k_random_5k.json"
+  },
+  "logiqa_5k": {
+    "file_name": "AdaptEval/logiqa_random_5k.json"
+  },
+  "meta_math_5k": {
+    "file_name": "AdaptEval/MetaMathQA_random_5k.json"
   }
 }

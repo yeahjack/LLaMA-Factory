@@ -101,3 +101,8 @@ def is_vllm_available():
 
 def is_sglang_available():
     return _is_package_available("sglang")
+
+
+@lru_cache
+def is_transformers_version_equal_to_4_46():
+    return version.parse("4.46.0") <= _get_package_version("transformers") <= version.parse("4.46.1")

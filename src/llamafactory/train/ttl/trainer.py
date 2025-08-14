@@ -1,4 +1,7 @@
-# Copyright 2025 the LlamaFactory team.
+# Copyright 2024 HuggingFace Inc. and the LlamaFactory team.
+#
+# This code is inspired by the HuggingFace's transformers library.
+# https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/trainer_seq2seq.py
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,178 +15,272 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-from typing import TYPE_CHECKING, Callable, Optional  # Callable 保留兼容（未使用）
+import json
+import os
+from types import MethodType
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, Callable
 
+import numpy as np
 import torch
-from torch.nn import CrossEntropyLoss
+import torch.nn as nn
+import torch.nn.functional as F
+
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
+from ...extras import logging
 from ...extras.constants import IGNORE_INDEX
-from ...extras.logging import get_logger
+from ...extras.packages import is_transformers_version_equal_to_4_46
+from ..callbacks import PissaConvertCallback, SaveProcessorCallback
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
 
 
 if TYPE_CHECKING:
+    from torch.utils.data import Dataset
+    from transformers import ProcessorMixin
+    from transformers.trainer import PredictionOutput
+
     from ...hparams import FinetuningArguments
 
-logger = get_logger(__name__)
+from transformers import AutoModelForCausalLM
+
+logger = logging.get_logger(__name__)
 
 
-class TTLTrainer(Seq2SeqTrainer):
-    """Seq2Seq Trainer for Test-Time Learning (TTL).
-
-    与最初版本不同：TTL 损失（基于 NLL/PPL + 可选样本选择）在本类 `compute_loss()` 内部原生实现。
-    `compute_loss_func` 参数仅保留以兼容旧调用；实际被忽略。
+class CustomSeq2SeqTrainer(Seq2SeqTrainer):
+    r"""
+    Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE.
     """
 
     def __init__(
-        self,
-        finetuning_args: "FinetuningArguments",
-        compute_loss_func: Optional[Callable] = None,  # deprecated, ignored
-        *args,
-        **kwargs,
-    ):
-        super().__init__(*args, **kwargs)
+        self, finetuning_args: "FinetuningArguments", processor: Optional["ProcessorMixin"], model_args=None, data_args=None, pretrain_model=None, **kwargs   # 字符串表示类型，增强静态检查的准确性
+    ) -> None:
+        super().__init__(**kwargs)
         self.finetuning_args = finetuning_args
-        # token-level logging: list of (shift_labels[B,L], per_token_nll[B,L], mask_bool[B,L])
-        self.token_log = []
+        self.model_args = model_args
+        self.data_args = data_args
+        self.pretrain_model = pretrain_model
+        # self.ref_model = AutoModelForCausalLM.from_pretrained("/hujinwu/LLM_Assemble/pretrain_model/Meta-Llama-3-8B-Instruct", torch_dtype=torch.bfloat16).to("cuda")
+
+        if processor is not None:
+            self.add_callback(SaveProcessorCallback(processor))
+
+        if finetuning_args.pissa_convert:
+            self.add_callback(PissaConvertCallback)
+
+        if finetuning_args.use_badam:
+            from badam import BAdamCallback, clip_grad_norm_old_version  # type: ignore
+
+            self.accelerator.clip_grad_norm_ = MethodType(clip_grad_norm_old_version, self.accelerator)
+            self.add_callback(BAdamCallback)
 
     @override
-    def create_optimizer(self):
+    def create_optimizer(self) -> "torch.optim.Optimizer":
         if self.optimizer is None:
             self.optimizer = create_custom_optimizer(self.model, self.args, self.finetuning_args)
         return super().create_optimizer()
 
     @override
-    def create_scheduler(self, num_training_steps: int, optimizer=None):
+    def create_scheduler(
+        self, num_training_steps: int, optimizer: Optional["torch.optim.Optimizer"] = None
+    ) -> "torch.optim.lr_scheduler.LRScheduler":
         create_custom_scheduler(self.args, num_training_steps, optimizer)
         return super().create_scheduler(num_training_steps, optimizer)
 
     @override
-    def _get_train_sampler(self, *args, **kwargs):
-        if self.finetuning_args.disable_shuffling:
-            import torch as _torch
-
-            return _torch.utils.data.SequentialSampler(self.train_dataset)
-        return super()._get_train_sampler(*args, **kwargs)
-
-    # ------------------------------------------------------------------ #
-    # TTL 损失实现
-    #
-    # 配置字符串: "<metric>" 或 "<metric>_<selection>"
-    #
-    #   metric    ∈ {"nll","ppl"} : 实际优化的序列级度量（梯度来源）
-    #   selection ∈ {"nll","ppl"} : 可选；若提供则启用样本选择 gating；
-    #                               阈值比较在 selection 空间中完成。
-    #
-    #   示例：
-    #       ttl_loss="nll"        -> 优化 NLL；无 selection。
-    #       ttl_loss="ppl"        -> 优化 PPL；无 selection（不推荐大模型，梯度噪声大）。
-    #       ttl_loss="nll_ppl"    -> 优化 NLL；用 PPL 做 gating（高困惑度样本）。
-    #       ttl_loss="ppl_nll"    -> 优化 PPL；用 NLL gating。
-    #       ttl_loss="nll_nll"    -> 优化 NLL；用 NLL gating。
-    #
-    # 返回值：标量平均损失（符合 HF Trainer 期望），无需随 batch-size 调整 LR。
-    # ------------------------------------------------------------------ #
-    @override
-    def compute_loss(
+    def prediction_step(
         self,
-        model,
-        inputs,
-        return_outputs: bool = False,
-        num_items_in_batch=None,
-    ):
-        # --- Forward ---------------------------------------------------------- #
-        # TTL 自定义损失，不需要模型内部计算 supervised loss，因此去掉 labels 等监督键。
-        if "labels" in inputs:
-            model_inputs = {k: v for k, v in inputs.items() if k != "labels"}
-        else:
-            model_inputs = inputs
-        outputs = model(**model_inputs)
-        logits = outputs["logits"]  # [B, L, V]
+        model: "torch.nn.Module",
+        inputs: Dict[str, Union["torch.Tensor", Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ) -> Tuple[Optional[float], Optional["torch.Tensor"], Optional["torch.Tensor"]]:
+        r"""
+        Removes the prompt part in the generated tokens.
 
-        # 获取原始输入序列 (shift labels)
-        if "input_ids" in inputs:
-            input_ids = inputs["input_ids"]
-        else:  # 兜底（workflow monkey-patch）
-            input_ids = outputs.get("input_ids", None)
-            if input_ids is None:
-                raise RuntimeError("TTLTrainer.compute_loss: 无 input_ids；请确保 collator 传入 inputs['input_ids'].")
+        Subclass and override to inject custom behavior.
+        """
+        labels = inputs["labels"] if "labels" in inputs else None
+        if self.args.predict_with_generate:
+            assert self.processing_class.padding_side == "left", "This method only accepts left-padded tensor."
+            labels = labels.detach().clone() if labels is not None else None  # backup labels
+            prompt_len, label_len = inputs["input_ids"].size(-1), inputs["labels"].size(-1)
+            if prompt_len > label_len:
+                inputs["labels"] = self._pad_tensors_to_target_len(inputs["labels"], inputs["input_ids"])
+            if label_len > prompt_len:  # truncate the labels instead of padding the inputs (llama2 fp16 compatibility)
+                inputs["labels"] = inputs["labels"][:, :prompt_len]
 
-        # -------- per-token NLL ------------------------------------------------ #
-        shift_logits = logits[..., :-1, :].contiguous()  # [B, L-1, V]
-        shift_labels = input_ids[..., 1:].contiguous()  # [B, L-1]
+        loss, generated_tokens, _ = super().prediction_step(  # ignore the returned labels (may be truncated)
+            model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys
+        )
+        if generated_tokens is not None and self.args.predict_with_generate:
+            generated_tokens[:, :prompt_len] = self.processing_class.pad_token_id
+            generated_tokens = generated_tokens.contiguous()
 
-        loss_fct = CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
-        per_token_loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-        ).view(shift_labels.size())  # [B, L-1]
+        return loss, generated_tokens, labels
 
-        # 保存未 mask CE 作为 NLL（供 token_log 导出）
-        per_token_nll_unmasked = per_token_loss
+    def _pad_tensors_to_target_len(self, src_tensor: "torch.Tensor", tgt_tensor: "torch.Tensor") -> "torch.Tensor":
+        r"""
+        Pads the tensor to the same length as the target tensor.
+        """
+        assert self.processing_class.pad_token_id is not None, "Pad token is required."
+        padded_tensor = self.processing_class.pad_token_id * torch.ones_like(tgt_tensor)
+        padded_tensor[:, -src_tensor.shape[-1] :] = src_tensor  # adopt left-padding
+        return padded_tensor.contiguous()  # in contiguous memory
 
-        mask = shift_labels != IGNORE_INDEX  # [B, L-1]
-        per_token_loss = per_token_loss * mask
+    def save_predictions(self, dataset: "Dataset", predict_results: "PredictionOutput") -> None:
+        r"""
+        Saves model predictions to `output_dir`.
 
-        token_counts = mask.sum(dim=1).clamp(min=1)  # [B]
-        per_sample_nll = per_token_loss.sum(dim=1) / token_counts
-        per_sample_ppl = torch.exp(per_sample_nll.clamp(max=20))  # 防 overflow
+        A custom behavior that not contained in Seq2SeqTrainer.
+        """
+        if not self.is_world_process_zero():
+            return
 
-        # -------- 解析 ttl_loss 字符串 ----------------------------------------- #
-        ttl_loss_cfg = getattr(self.finetuning_args, "ttl_loss", "ppl_ppl")
-        parts = ttl_loss_cfg.split("_")
-        if not (1 <= len(parts) <= 2):
-            raise ValueError(f"ttl_loss 必须形如 '<metric>' 或 '<metric>_<selection>'，收到: {ttl_loss_cfg}")
+        output_prediction_file = os.path.join(self.args.output_dir, "generated_predictions.jsonl")
+        logger.info_rank0(f"Saving prediction results to {output_prediction_file}")
 
-        metric_form = parts[0].lower()
-        selection_form = parts[1].lower() if len(parts) == 2 else None
+        labels = np.where(
+            predict_results.label_ids != IGNORE_INDEX, predict_results.label_ids, self.processing_class.pad_token_id
+        )
+        preds = np.where(
+            predict_results.predictions != IGNORE_INDEX, predict_results.predictions, self.processing_class.pad_token_id
+        )
 
-        if metric_form not in {"nll", "ppl"}:
-            raise ValueError(f"Unsupported metric_form: {metric_form}")
-        if selection_form is not None and selection_form not in {"nll", "ppl"}:
-            raise ValueError(f"Unsupported selection_form: {selection_form}")
+        for i in range(len(preds)):
+            pad_len = np.nonzero(preds[i] != self.processing_class.pad_token_id)[0]
+            if len(pad_len):  # move pad token to last
+                preds[i] = np.concatenate((preds[i][pad_len[0] :], preds[i][: pad_len[0]]), axis=-1)
 
-        # -------- selection gating (optional) ---------------------------------- #
-        selection_score = None
-        if selection_form is not None:
-            # scaler / threshold
-            scaler = getattr(self.finetuning_args, "ttl_sample_efficiency_scaler", 1.0)
-            base_threshold = getattr(self.finetuning_args, "ttl_threshold", 3.0)
+        decoded_inputs = self.processing_class.batch_decode(dataset["input_ids"], skip_special_tokens=True)
+        decoded_labels = self.processing_class.batch_decode(labels, skip_special_tokens=True)
+        decoded_preds = self.processing_class.batch_decode(preds, skip_special_tokens=True)
 
-            if selection_form == "ppl":
-                ppl_threshold = math.exp(base_threshold)  # interpret base_threshold as log-ppl
-                indicator = (per_sample_ppl > ppl_threshold).float()
-                raw_score = (per_sample_ppl / ppl_threshold).clamp(max=1e6)
-            else:  # "nll"
-                nll_threshold = base_threshold
-                indicator = (per_sample_nll > nll_threshold).float()
-                raw_score = (per_sample_nll / nll_threshold).clamp(max=1e6)
+        with open(output_prediction_file, "a", encoding="utf-8") as writer:
+            res: List[str] = []
+            for text, label, pred in zip(decoded_inputs, decoded_labels, decoded_preds):
+                res.append(json.dumps({"prompt": text, "label": label, "predict": pred}, ensure_ascii=False))
 
-            selection_score = (scaler * raw_score * indicator).detach()  # [B]
+            writer.write("\n".join(res)+"\n")
 
-            num_selected = int(indicator.sum().item())
-            total = per_sample_ppl.size(0)
-            logger.info_rank0(f"[TTL] Selected {num_selected} / {total} high-perplexity samples.")
 
-        # -------- metric for optimization -------------------------------------- #
-        per_sample_metric = per_sample_ppl if metric_form == "ppl" else per_sample_nll
 
-        if selection_score is None:
-            ttl_loss = per_sample_metric.mean()
-        else:
-            ttl_loss = (selection_score * per_sample_metric).mean()
+    @torch.no_grad()
+    def cal_ce(self, logits, labels):
+        """
+        计算 cross entropy
+        """
+        criterion = torch.nn.CrossEntropyLoss(reduction="none")
+        shift_logits: "torch.Tensor" = logits[..., :-1, :]
+        shift_labels: "torch.Tensor" = labels[..., 1:]
+        loss_mask = shift_labels != IGNORE_INDEX
+        flatten_logits = shift_logits.contiguous().view(shift_labels.size(0)*shift_labels.size(1), -1)
+        flatten_labels = shift_labels.contiguous().view(-1)
+        token_logps: "torch.Tensor" = criterion(flatten_logits, flatten_labels) # [bs*seq_len]
+        token_logps = token_logps.contiguous().view(shift_logits.size(0), -1)  # [bs, seq_len]
+        sentence_logps_normal = (token_logps*loss_mask).sum(-1) / loss_mask.sum(-1)  # [bs]
+        return sentence_logps_normal
 
-        # -------- token-level logging ------------------------------------------ #
-        if self.is_in_train and shift_labels.numel() > 0:
-            self.token_log.append(
-                (
-                    shift_labels.detach().cpu(),  # token ids
-                    per_token_nll_unmasked.detach().cpu(),  # raw CE
-                    mask.detach().cpu().bool(),  # valid positions
-                )
-            )
 
-        return (ttl_loss, outputs) if return_outputs else ttl_loss
+    def cal_kl(self, logits, labels):
+        loss_fct = nn.KLDivLoss(reduction='batchmean')
+
+        shift_logits: "torch.Tensor" = logits[..., :-1, :]
+        shift_labels: "torch.Tensor" = labels[..., 1:]
+
+        sentence_kl = torch.zeros(shift_logits.size(0), device=shift_logits.device)  # [bs]
+        for i, (shift_logit, shift_label) in enumerate(zip(shift_logits, shift_labels)):
+            mask = shift_label != IGNORE_INDEX
+            shift_logit, shift_label = shift_logit[mask], shift_label[mask]
+            log_probs = shift_logit.log_softmax(dim=-1)
+            one_hot_targets = torch.zeros_like(log_probs).scatter_(1, shift_label.unsqueeze(1), 1).to(log_probs.device)
+            sentence_kl[i] = loss_fct(log_probs, one_hot_targets)
+
+        return sentence_kl
+
+
+    def log_to_file(self, sentence_ce, sentence_kl, mask, coeff, loss):
+        """
+        Log the sentence cross-entropy and KL divergence to a file.
+        """
+        with open(f"{self.args.output_dir}/logfile.txt", 'a', encoding="utf-8") as f:
+            for ce, kl, m, coef in zip(sentence_ce.clone().detach(), sentence_kl.clone().detach(), mask, coeff):
+                if m:
+                    print(f"This sample is selected. Threshold: {self.finetuning_args.threshold}, Cross-entropy: {ce}, KL divergence: {kl}, Weight coefficient: {coef}, Final loss: {loss}", file=f)
+                else:
+                    print(f"This sample is discarded. Threshold: {self.finetuning_args.threshold}, Cross-entropy: {ce}, KL divergence: {kl}", file=f)
+
+    @override
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        assert self.processing_class.padding_side == 'right', "Training should be done with right padding."
+        # The `inputs` dict contains `labels` which are the ground-truth answers.
+        # To align with the paper's self-supervised methodology (minimizing input perplexity P(x)),
+        # we must use `inputs["input_ids"]` as the target for all loss calculations,
+        # effectively ignoring the provided `inputs["labels"]`.
+
+        if self.finetuning_args.setting == "offline_ttl":
+
+            # 1. In offline setting, perform a forward pass using the base model to get logits
+            with torch.no_grad():
+                model.eval()
+                with self.accelerator.unwrap_model(model).disable_adapter():
+                    # FIX: Pass only input_ids and attention_mask to prevent the model from using ground-truth `labels` for internal loss calculation.
+                    pretrain_outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
+                    pretrain_logits = pretrain_outputs.logits
+                    # FIX: Calculate perplexity of the INPUT (x) itself, not the output (y). Use `input_ids` as the target.
+                    sentence_ce = self.cal_ce(pretrain_logits, inputs["input_ids"])
+
+            # 2. Filter samples based on cross-entropy (equivalent to KL divergence), keep those above threshold, and calculate weighting coefficients
+            mask = sentence_ce > self.finetuning_args.threshold
+            coeff = self.finetuning_args.lamb * torch.exp(sentence_ce.clone().detach() - self.finetuning_args.threshold) # [bs,]
+
+            model.train() # Resume training mode
+            # FIX: Pass only input_ids and attention_mask to get logits for the self-supervised update.
+            outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
+            # 3. Calculate KL divergence for the self-supervised objective.
+            # FIX: The target for the training loss must also be the `input_ids`.
+            sentence_kl = self.cal_kl(outputs.logits, inputs["input_ids"])
+
+            # 4. Compute total loss
+            sentence_kl = sentence_kl.mul(coeff).mul(mask)  # [bs,]
+            if mask.sum() == 0:
+                total_loss = sentence_kl.mean()
+            else:
+                total_loss = sentence_kl.sum() / mask.sum()
+
+            self.log_to_file(sentence_ce.clone().detach(), sentence_kl.clone().detach(), mask, coeff, total_loss.item())
+
+        elif self.finetuning_args.setting == "online_ttl":
+            # 1. Perform a forward pass using the model being trained to get logits
+            # FIX: Pass only input_ids and attention_mask to get logits for the self-supervised objective.
+            outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
+            # 2. Filter samples based on cross-entropy; in online setting, CE is calculated from current model
+            # FIX: Calculate perplexity of the INPUT (x) itself. Use `input_ids` as the target.
+            sentence_ce = self.cal_ce(outputs.logits, inputs["input_ids"])  # [bs,]
+            mask = sentence_ce > self.finetuning_args.threshold  # Keep samples above threshold
+            # 3. Calculate KL divergence for the self-supervised objective.
+            # FIX: The target for the training loss must also be the `input_ids`.
+            sentence_kl = self.cal_kl(outputs.logits, inputs["input_ids"])  # [bs,]
+            coeff = self.finetuning_args.lamb * torch.exp(sentence_ce.clone().detach() - self.finetuning_args.threshold) # [bs,]
+
+            # 4. Compute total loss
+            sentence_kl = sentence_kl.mul(coeff).mul(mask)  # [bs,]
+
+            if mask.sum() == 0:
+                total_loss = sentence_kl.mean()
+            else:
+                total_loss = sentence_kl.sum() / mask.sum()
+
+            self.log_to_file(sentence_ce.clone().detach(), sentence_kl.clone().detach(), mask, coeff, total_loss.item())
+
+
+        if is_transformers_version_equal_to_4_46() and not getattr(self, "model_accepts_loss_kwargs", False):
+            # other model should not scale the loss
+            if return_outputs:
+                return(total_loss / self.args.gradient_accumulation_steps, outputs)
+            else:
+                return total_loss / self.args.gradient_accumulation_steps
+
+        # For newer transformers versions, the Trainer handles gradient accumulation scaling.
+        # The `outputs` from our modified call doesn't contain a loss, so we return our calculated `total_loss`.
+        return (total_loss, outputs) if return_outputs else total_loss
