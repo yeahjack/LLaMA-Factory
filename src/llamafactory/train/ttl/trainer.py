@@ -18,13 +18,11 @@
 import json
 import os
 from types import MethodType
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, Callable
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
@@ -42,18 +40,20 @@ if TYPE_CHECKING:
 
     from ...hparams import FinetuningArguments
 
-from transformers import AutoModelForCausalLM
-
 logger = logging.get_logger(__name__)
 
 
 class CustomSeq2SeqTrainer(Seq2SeqTrainer):
-    r"""
-    Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE.
-    """
+    r"""Inherits Seq2SeqTrainer to compute generative metrics such as BLEU and ROUGE."""
 
     def __init__(
-        self, finetuning_args: "FinetuningArguments", processor: Optional["ProcessorMixin"], model_args=None, data_args=None, pretrain_model=None, **kwargs   # 字符串表示类型，增强静态检查的准确性
+        self,
+        finetuning_args: "FinetuningArguments",
+        processor: Optional["ProcessorMixin"],
+        model_args=None,
+        data_args=None,
+        pretrain_model=None,
+        **kwargs,  # 字符串表示类型，增强静态检查的准确性
     ) -> None:
         super().__init__(**kwargs)
         self.finetuning_args = finetuning_args
@@ -91,18 +91,17 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     def prediction_step(
         self,
         model: "torch.nn.Module",
-        inputs: Dict[str, Union["torch.Tensor", Any]],
+        inputs: dict[str, Union["torch.Tensor", Any]],
         prediction_loss_only: bool,
-        ignore_keys: Optional[List[str]] = None,
-    ) -> Tuple[Optional[float], Optional["torch.Tensor"], Optional["torch.Tensor"]]:
-        r"""
-        Removes the prompt part in the generated tokens.
+        ignore_keys: Optional[list[str]] = None,
+    ) -> tuple[Optional[float], Optional["torch.Tensor"], Optional["torch.Tensor"]]:
+        r"""Removes the prompt part in the generated tokens.
 
         Subclass and override to inject custom behavior.
         """
         labels = inputs["labels"] if "labels" in inputs else None
         if self.args.predict_with_generate:
-            assert self.processing_class.padding_side == "left", "This method only accepts left-padded tensor."
+            assert self.tokenizer.padding_side == "left", "This method only accepts left-padded tensor."
             labels = labels.detach().clone() if labels is not None else None  # backup labels
             prompt_len, label_len = inputs["input_ids"].size(-1), inputs["labels"].size(-1)
             if prompt_len > label_len:
@@ -114,23 +113,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             model, inputs, prediction_loss_only=prediction_loss_only, ignore_keys=ignore_keys
         )
         if generated_tokens is not None and self.args.predict_with_generate:
-            generated_tokens[:, :prompt_len] = self.processing_class.pad_token_id
+            generated_tokens[:, :prompt_len] = self.tokenizer.pad_token_id
             generated_tokens = generated_tokens.contiguous()
 
         return loss, generated_tokens, labels
 
     def _pad_tensors_to_target_len(self, src_tensor: "torch.Tensor", tgt_tensor: "torch.Tensor") -> "torch.Tensor":
-        r"""
-        Pads the tensor to the same length as the target tensor.
-        """
-        assert self.processing_class.pad_token_id is not None, "Pad token is required."
-        padded_tensor = self.processing_class.pad_token_id * torch.ones_like(tgt_tensor)
+        r"""Pads the tensor to the same length as the target tensor."""
+        assert self.tokenizer.pad_token_id is not None, "Pad token is required."
+        padded_tensor = self.tokenizer.pad_token_id * torch.ones_like(tgt_tensor)
         padded_tensor[:, -src_tensor.shape[-1] :] = src_tensor  # adopt left-padding
         return padded_tensor.contiguous()  # in contiguous memory
 
     def save_predictions(self, dataset: "Dataset", predict_results: "PredictionOutput") -> None:
-        r"""
-        Saves model predictions to `output_dir`.
+        r"""Saves model predictions to `output_dir`.
 
         A custom behavior that not contained in Seq2SeqTrainer.
         """
@@ -141,52 +137,47 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         logger.info_rank0(f"Saving prediction results to {output_prediction_file}")
 
         labels = np.where(
-            predict_results.label_ids != IGNORE_INDEX, predict_results.label_ids, self.processing_class.pad_token_id
+            predict_results.label_ids != IGNORE_INDEX, predict_results.label_ids, self.tokenizer.pad_token_id
         )
         preds = np.where(
-            predict_results.predictions != IGNORE_INDEX, predict_results.predictions, self.processing_class.pad_token_id
+            predict_results.predictions != IGNORE_INDEX, predict_results.predictions, self.tokenizer.pad_token_id
         )
 
         for i in range(len(preds)):
-            pad_len = np.nonzero(preds[i] != self.processing_class.pad_token_id)[0]
+            pad_len = np.nonzero(preds[i] != self.tokenizer.pad_token_id)[0]
             if len(pad_len):  # move pad token to last
                 preds[i] = np.concatenate((preds[i][pad_len[0] :], preds[i][: pad_len[0]]), axis=-1)
 
-        decoded_inputs = self.processing_class.batch_decode(dataset["input_ids"], skip_special_tokens=True)
-        decoded_labels = self.processing_class.batch_decode(labels, skip_special_tokens=True)
-        decoded_preds = self.processing_class.batch_decode(preds, skip_special_tokens=True)
+        decoded_inputs = self.tokenizer.batch_decode(dataset["input_ids"], skip_special_tokens=True)
+        decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
+        decoded_preds = self.tokenizer.batch_decode(preds, skip_special_tokens=True)
 
         with open(output_prediction_file, "a", encoding="utf-8") as writer:
-            res: List[str] = []
+            res: list[str] = []
             for text, label, pred in zip(decoded_inputs, decoded_labels, decoded_preds):
                 res.append(json.dumps({"prompt": text, "label": label, "predict": pred}, ensure_ascii=False))
 
-            writer.write("\n".join(res)+"\n")
-
-
+            writer.write("\n".join(res) + "\n")
 
     @torch.no_grad()
     def cal_ce(self, logits, labels):
-        """
-        计算 cross entropy
-        """
+        """计算 cross entropy."""
         criterion = torch.nn.CrossEntropyLoss(reduction="none")
-        shift_logits: "torch.Tensor" = logits[..., :-1, :]
-        shift_labels: "torch.Tensor" = labels[..., 1:]
+        shift_logits: torch.Tensor = logits[..., :-1, :]
+        shift_labels: torch.Tensor = labels[..., 1:]
         loss_mask = shift_labels != IGNORE_INDEX
-        flatten_logits = shift_logits.contiguous().view(shift_labels.size(0)*shift_labels.size(1), -1)
+        flatten_logits = shift_logits.contiguous().view(shift_labels.size(0) * shift_labels.size(1), -1)
         flatten_labels = shift_labels.contiguous().view(-1)
-        token_logps: "torch.Tensor" = criterion(flatten_logits, flatten_labels) # [bs*seq_len]
+        token_logps: torch.Tensor = criterion(flatten_logits, flatten_labels)  # [bs*seq_len]
         token_logps = token_logps.contiguous().view(shift_logits.size(0), -1)  # [bs, seq_len]
-        sentence_logps_normal = (token_logps*loss_mask).sum(-1) / loss_mask.sum(-1)  # [bs]
+        sentence_logps_normal = (token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)  # [bs]
         return sentence_logps_normal
 
-
     def cal_kl(self, logits, labels):
-        loss_fct = nn.KLDivLoss(reduction='batchmean')
+        loss_fct = nn.KLDivLoss(reduction="batchmean")
 
-        shift_logits: "torch.Tensor" = logits[..., :-1, :]
-        shift_labels: "torch.Tensor" = labels[..., 1:]
+        shift_logits: torch.Tensor = logits[..., :-1, :]
+        shift_labels: torch.Tensor = labels[..., 1:]
 
         sentence_kl = torch.zeros(shift_logits.size(0), device=shift_logits.device)  # [bs]
         for i, (shift_logit, shift_label) in enumerate(zip(shift_logits, shift_labels)):
@@ -198,28 +189,30 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         return sentence_kl
 
-
     def log_to_file(self, sentence_ce, sentence_kl, mask, coeff, loss):
-        """
-        Log the sentence cross-entropy and KL divergence to a file.
-        """
-        with open(f"{self.args.output_dir}/logfile.txt", 'a', encoding="utf-8") as f:
+        """Log the sentence cross-entropy and KL divergence to a file."""
+        with open(f"{self.args.output_dir}/logfile.txt", "a", encoding="utf-8") as f:
             for ce, kl, m, coef in zip(sentence_ce.clone().detach(), sentence_kl.clone().detach(), mask, coeff):
                 if m:
-                    print(f"This sample is selected. Threshold: {self.finetuning_args.threshold}, Cross-entropy: {ce}, KL divergence: {kl}, Weight coefficient: {coef}, Final loss: {loss}", file=f)
+                    print(
+                        f"This sample is selected. Threshold: {self.finetuning_args.threshold}, Cross-entropy: {ce}, KL divergence: {kl}, Weight coefficient: {coef}, Final loss: {loss}",
+                        file=f,
+                    )
                 else:
-                    print(f"This sample is discarded. Threshold: {self.finetuning_args.threshold}, Cross-entropy: {ce}, KL divergence: {kl}", file=f)
+                    print(
+                        f"This sample is discarded. Threshold: {self.finetuning_args.threshold}, Cross-entropy: {ce}, KL divergence: {kl}",
+                        file=f,
+                    )
 
     @override
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        assert self.processing_class.padding_side == 'right', "Training should be done with right padding."
+        assert self.tokenizer.padding_side == "right", "Training should be done with right padding."
         # The `inputs` dict contains `labels` which are the ground-truth answers.
         # To align with the paper's self-supervised methodology (minimizing input perplexity P(x)),
         # we must use `inputs["input_ids"]` as the target for all loss calculations,
         # effectively ignoring the provided `inputs["labels"]`.
 
         if self.finetuning_args.setting == "offline_ttl":
-
             # 1. In offline setting, perform a forward pass using the base model to get logits
             with torch.no_grad():
                 model.eval()
@@ -232,9 +225,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             # 2. Filter samples based on cross-entropy (equivalent to KL divergence), keep those above threshold, and calculate weighting coefficients
             mask = sentence_ce > self.finetuning_args.threshold
-            coeff = self.finetuning_args.lamb * torch.exp(sentence_ce.clone().detach() - self.finetuning_args.threshold) # [bs,]
+            coeff = self.finetuning_args.lamb * torch.exp(
+                sentence_ce.clone().detach() - self.finetuning_args.threshold
+            )  # [bs,]
 
-            model.train() # Resume training mode
+            model.train()  # Resume training mode
             # FIX: Pass only input_ids and attention_mask to get logits for the self-supervised update.
             outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
             # 3. Calculate KL divergence for the self-supervised objective.
@@ -248,7 +243,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             else:
                 total_loss = sentence_kl.sum() / mask.sum()
 
-            self.log_to_file(sentence_ce.clone().detach(), sentence_kl.clone().detach(), mask, coeff, total_loss.item())
+            self.log_to_file(
+                sentence_ce.clone().detach(), sentence_kl.clone().detach(), mask, coeff, total_loss.item()
+            )
 
         elif self.finetuning_args.setting == "online_ttl":
             # 1. Perform a forward pass using the model being trained to get logits
@@ -261,7 +258,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # 3. Calculate KL divergence for the self-supervised objective.
             # FIX: The target for the training loss must also be the `input_ids`.
             sentence_kl = self.cal_kl(outputs.logits, inputs["input_ids"])  # [bs,]
-            coeff = self.finetuning_args.lamb * torch.exp(sentence_ce.clone().detach() - self.finetuning_args.threshold) # [bs,]
+            coeff = self.finetuning_args.lamb * torch.exp(
+                sentence_ce.clone().detach() - self.finetuning_args.threshold
+            )  # [bs,]
 
             # 4. Compute total loss
             sentence_kl = sentence_kl.mul(coeff).mul(mask)  # [bs,]
@@ -271,13 +270,14 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             else:
                 total_loss = sentence_kl.sum() / mask.sum()
 
-            self.log_to_file(sentence_ce.clone().detach(), sentence_kl.clone().detach(), mask, coeff, total_loss.item())
-
+            self.log_to_file(
+                sentence_ce.clone().detach(), sentence_kl.clone().detach(), mask, coeff, total_loss.item()
+            )
 
         if is_transformers_version_equal_to_4_46() and not getattr(self, "model_accepts_loss_kwargs", False):
             # other model should not scale the loss
             if return_outputs:
-                return(total_loss / self.args.gradient_accumulation_steps, outputs)
+                return (total_loss / self.args.gradient_accumulation_steps, outputs)
             else:
                 return total_loss / self.args.gradient_accumulation_steps
 

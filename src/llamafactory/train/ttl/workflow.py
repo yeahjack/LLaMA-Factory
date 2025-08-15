@@ -114,19 +114,9 @@ class TTLModel(nn.Module):
 
         # predict
         gen_kwargs = self.generating_args.to_dict()
-        # 1) generate() 不接受的解码相关参数
-        gen_kwargs.pop("skip_special_tokens", None)
-        gen_kwargs.pop("clean_up_tokenization_spaces", None)  # 若你的 GeneratingArguments 有这个
-
-        # 2) 如果不是采样，就移除采样相关参数（可选，仅为干净的日志）
-        if not gen_kwargs.get("do_sample", False):
-            for k in ("temperature", "top_p", "top_k", "typical_p"):
-                gen_kwargs.pop(k, None)
-
         gen_kwargs["eos_token_id"] = [self.tokenizer.eos_token_id] + self.tokenizer.additional_special_tokens_ids
         gen_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
         gen_kwargs["logits_processor"] = get_logits_processor()
-
         # decoder-only models must use left-padding for batched generation.
         if self.training_args.predict_with_generate:
             self.tokenizer.padding_side = "left"  # use left-padding in generation
@@ -154,8 +144,6 @@ class TTLModel(nn.Module):
         )  # the folder to save prediction results
         # Keyword arguments for `model.generate`
         gen_kwargs = self.generating_args.to_dict()
-        gen_kwargs.pop("skip_special_tokens", None)
-        gen_kwargs.pop("clean_up_tokenization_spaces", None)  # 若你的 GeneratingArguments 有这个
         gen_kwargs["eos_token_id"] = [self.tokenizer.eos_token_id] + self.tokenizer.additional_special_tokens_ids
         gen_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
         gen_kwargs["logits_processor"] = get_logits_processor()
