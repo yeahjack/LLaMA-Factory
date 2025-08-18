@@ -95,15 +95,15 @@ datasets=(
   # "rb_metamath"
   # "rb_logiqa"
   "agriculture_5k"
-  # "geosignal_5k"
-  # "gen_med_gpt_5k"
-  # "wealth_5k"
-  # "alpaca_gpt4_5k"
-  # "instruction_wild_5k"
-  # "dolly_5k"
-  # "gsm8k_5k"
-  # "logiqa_5k"
-  # "meta_math_5k"
+  "geosignal_5k"
+  "gen_med_gpt_5k"
+  "wealth_5k"
+  "alpaca_gpt4_5k"
+  "instruction_wild_5k"
+  "dolly_5k"
+  "gsm8k_5k"
+  "logiqa_5k"
+  "meta_math_5k"
 )
 
 gpus=(0)
@@ -558,10 +558,20 @@ execute_stage_globally() {
       case "${stage_name}" in
         "train")
           local lr=""
-          if [[ "$dataset" == db_* || "$dataset" == ib_* ]]; then lr="5e-5"
-          elif [[ "$dataset" == rb_* ]]; then lr="1e-6"
-          else lr="5e-5"
-          fi
+          case "$dataset" in
+            "gsm8k_5k"|"logiqa_5k"|"meta_math_5k")
+              lr="1e-6"
+              ;;
+            rb_*)
+              lr="1e-6"
+              ;;
+            db_*|ib_*)
+              lr="5e-5"
+              ;;
+            *)
+              lr="5e-5"
+              ;;
+          esac
           run_train "${method}" "${dataset}" "${gen_len}" "${target_gpu_id}" "${lr}" || true
           ;;
         "infer")
