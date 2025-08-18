@@ -1,0 +1,93 @@
+### model
+model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+trust_remote_code: true
+
+### method
+stage: ttlu
+do_train: true
+finetuning_type: lora
+lora_rank: 8
+lora_target: q_proj,v_proj
+# deepspeed: examples/deepspeed/ds_z3_config.json  # choices: [ds_z0_config.json, ds_z2_config.json, ds_z3_config.json]
+
+### dataset
+dataset: agriculture_5k
+template: qwen
+cutoff_len: 8192
+#max_samples: 100
+overwrite_cache: true
+preprocessing_num_workers: 128
+dataloader_num_workers: 16
+
+# TTL
+ttl_setting: offline_ttl
+ttl_ref_mode: precompute
+ttl_ref_batch_size: 64
+ttl_direct_inference: false
+ttl_threshold: 3
+ttl_sample_efficiency_scaler: 0.1
+ttl_streaming_batch_size: 100
+
+### output
+output_dir: saves/qwen25_7b/lora/ttl_loss_change/test
+logging_steps: 10
+save_steps: 5000
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: wandb  # choices: [none, wandb, tensorboard, swanlab, mlflow]
+run_name: db_agriculture
+# report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1e-6
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+seed: 42
+# tokenized_path: tokenized_path
+
+### eval
+# eval_dataset: alpaca_en_demo
+# val_size: 0.1
+# per_device_eval_batch_size: 1
+# eval_strategy: steps
+# eval_steps: 500
+
+# ttltent
+# === Loss权重配置 ===
+loss_weight_ttl: 1.0          # TTL损失权重，控制输入序列perplexity优化的强度
+loss_weight_tent: 1.0         # TENT损失权重，控制生成序列entropy最小化的强度
+kl_weight: 0.04               # KL正则化权重，防止模型更新过度偏离原始状态
+
+# === Loss平衡方法 ===
+# choices: ["static", "dynamic_weight", "gradient_magnitude", "uncertainty", "moving_average", "adaptive_scaling"]
+# - static: 使用固定权重，不进行动态调整
+# - dynamic_weight: 根据loss变化趋势动态调整权重
+# - gradient_magnitude: 根据梯度大小自动平衡权重 (推荐)
+# - uncertainty: 学习最优权重，理论最佳但训练较慢
+# - moving_average: 基于移动平均的简单平衡方法
+# - adaptive_scaling: 自适应缩放因子调整
+loss_balancing_method: gradient_magnitude
+
+# === 训练模式配置 ===
+# 是否使用交替训练模式：奇数步优化perplexity，偶数步优化entropy
+# choices: [true, false]
+# - false: 每步同时优化TTL和TENT损失 (默认)
+# - true: 交替优化，适合两个loss scale差异很大的情况
+alternating_training: false
+
+# === 正则化配置 ===
+# 是否使用KL正则化防止模型过度更新
+# choices: [true, false]
+# - true: 添加KL散度项约束模型不要偏离原始参数太远
+# - false: 不使用KL正则化
+use_kl_regularization: false
+
+# Flash Attention
+flash_attn: fa2
