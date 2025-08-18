@@ -4,7 +4,7 @@ set -e
 set -o pipefail
 
 echo "==> 切换到 LLaMA-Factory 根目录..."
-cd "/home/yijiexu/LLaMA-Factory/" || exit 1
+cd "../" || exit 1
 echo "==> 当前目录: $(pwd)"
 echo ""
 
