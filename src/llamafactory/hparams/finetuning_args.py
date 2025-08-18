@@ -456,44 +456,48 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute effective tokens per second."},
     )
-    ttl_threshold: float = field(
-        default=1,
-        metadata={"help": "Default perplexity threshold for TTL. Can be overridden by user."},
+    # TTL 训练模式：离线(先训后推) 或 在线(分片先推再训)
+    ttl_setting: str = field(
+        default="offline_ttl",
+        metadata={"choices": ["offline_ttl", "online_ttl"],
+                  "help": "TTL training setting."}
     )
-    ttl_sample_efficiency_scaler: float = field(
-        default=0.1,
-        metadata={"help": "Scaling factor for TTL sample efficiency. Can be overridden by user."},
-    )
-    ttl_loss: str = field(
-        default="ppl_ppl",
-        metadata={
-            "help": (
-                "Specifies the TTL loss configuration. Format: <metric> or <metric>_<selection>, where:\n"
-                "- metric ∈ {ppl, nll}: the sequence-level objective being optimized (i.e., source of gradients)\n"
-                "- selection ∈ {ppl, nll} (optional): if provided, enables gating to select harder samples based on this metric\n"
-                "Examples:\n"
-                "  'nll'       → optimize NLL; no sample selection\n"
-                "  'ppl'       → optimize PPL; no selection\n"
-                "  'nll_ppl'   → optimize NLL; select high-PPL samples\n"
-                "  'ppl_nll'   → optimize PPL; select high-NLL samples\n"
-                "  'nll_nll'   → optimize NLL; select high-NLL samples\n"
-            )
-        },
-    )
-    # NEW: reference difficulty source for sample selection (minimal addition)
+
+    # 参考分布来源：训练前一次性用基座模型预计算，或训练时用当前模型即时计算
     ttl_ref_mode: str = field(
-        default="current",
-        metadata={
-            "help": (
-                "Reference source for TTL selection: 'current' (use the current model online) "
-                "or 'precompute_base' (use one-pass precomputed base NLL cache)."
-            )
-        },
+        default="precompute",
+        metadata={"choices": ["precompute", "simultaneous"],
+                  "help": "Reference CE source for gating."}
     )
-    # NEW: batch size for one-pass base precomputation (effective when ttl_ref_mode='precompute_base')
+
+    # 预计算参考 CE 时的 batch size（仅在 ttl_ref_mode=precompute 时使用）
     ttl_ref_batch_size: int = field(
         default=64,
-        metadata={"help": "Batch size used for one-pass base difficulty precomputation."},
+        metadata={"help": "Batch size for precomputing reference CE."}
+    )
+
+    # 是否在 TTL 阶段直接做推理（生成并落盘），false 则仅训练并保存 LoRA
+    ttl_direct_inference: bool = field(
+        default=False,
+        metadata={"help": "Run generation during TTL and save predictions."}
+    )
+
+    # 样本筛选阈值（对 sentence-level cross-entropy 比较）
+    ttl_threshold: float = field(
+        default=3.0,
+        metadata={"help": "Threshold on sentence CE for sample gating."}
+    )
+
+    # 样本权重系数：coef = scaler * exp(CE - threshold)
+    ttl_sample_efficiency_scaler: float = field(
+        default=0.1,
+        metadata={"help": "Scaler for exp(CE - threshold) weighting."}
+    )
+
+    # 在线 TTL 的流式分片大小（每次处理多少条样本）
+    ttl_streaming_batch_size: int = field(
+        default=100,
+        metadata={"help": "Streaming batch size for online TTL."}
     )
     generation_len: int = field(
         default=80, metadata={"help": "The number of tokens to generate for entropy calculation."}
@@ -512,7 +516,7 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether to use EM-FT's path-total entropy loss instead of TENT's average entropy loss."},
     )
-    # For Combined Loss
+    # Combined loss weights
     loss_weight_ttl: float = field(
         default=1.0,
         metadata={"help": "Weight of the TTL loss."},
@@ -521,7 +525,7 @@ class FinetuningArguments(
         default=1.0,
         metadata={"help": "Weight of the TENT loss."},
     )
-    # Combined Loss Ended
+    # EATA-related
     eata_entropy_threshold: float = field(
         default=0.4, metadata={"help": "Entropy threshold E₀ for EATA sample selection (S_ent)."}
     )
@@ -544,7 +548,7 @@ class FinetuningArguments(
     eata_sdiv_momentum: float = field(
         default=0.1, metadata={"help": "EMA momentum for updating the moving average of sample logits in S_div(x)."}
     )
-    # Loss Balancing Configuration
+    # Loss balancing configuration
     loss_balancing_method: str = field(
         default="static",
         metadata={
@@ -578,36 +582,6 @@ class FinetuningArguments(
         metadata={"help": "Weight for KL regularization loss. Only effective when use_kl_regularization=True."},
     )
 
-    # Official TLM
-    threshold: float = field(
-        default=2.0,
-        metadata={"help": "Masked the samples with the cross-entropy value smaller than this threshold."}
-    )
-
-    lamb: float = field(
-        default=0.1,
-        metadata={"help": "add when computing loss"}
-    )
-
-    setting: str = field(
-        default='offline_ttl',
-        metadata={"help": "the setting to choose"}
-    )
-
-    streaming_batch_size: int = field(
-        default=100,
-        metadata={"help": "The assumed batch size for streaming data when using the online_ttl setting."},
-    )
-
-    enable_ttl_inference: bool = field(
-        default=True,
-        metadata={
-            "help": (
-                "Whether to run inference (generate-and-save) during the TTL stage. "
-                "If False, skip inference and only save adapters/LoRA snapshots."
-            )
-        },
-    )
 
     def __post_init__(self):
         def split_arg(arg):
@@ -640,15 +614,6 @@ class FinetuningArguments(
         if self.use_llama_pro and self.finetuning_type == "full":
             raise ValueError("`use_llama_pro` is only valid for Freeze or LoRA training.")
 
-        if self.finetuning_type == "lora" and (self.use_galore or self.use_apollo or self.use_badam):
-            raise ValueError("Cannot use LoRA with GaLore, APOLLO or BAdam together.")
-
-        if int(self.use_galore) + int(self.use_apollo) + (self.use_badam) > 1:
-            raise ValueError("Cannot use GaLore, APOLLO or BAdam together.")
-
-        if self.pissa_init and (self.stage in ["ppo", "kto"] or self.use_ref_model):
-            raise ValueError("Cannot use PiSSA for current training stage.")
-
         if self.finetuning_type != "lora":
             if self.loraplus_lr_ratio is not None:
                 raise ValueError("`loraplus_lr_ratio` is only valid for LoRA training.")
@@ -661,6 +626,9 @@ class FinetuningArguments(
 
             if self.pissa_init:
                 raise ValueError("`pissa_init` is only valid for LoRA training.")
+
+        if int(self.use_galore) + int(self.use_apollo) + (self.use_badam) > 1:
+            raise ValueError("Cannot use GaLore, APOLLO or BAdam together.")
 
     def to_dict(self) -> dict[str, Any]:
         args = asdict(self)

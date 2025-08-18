@@ -1,29 +1,23 @@
-from typing import TYPE_CHECKING, List, Optional
-
+from typing import TYPE_CHECKING, Optional
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
 from ...extras.constants import IGNORE_INDEX
-from ...extras.misc import cal_effective_tokens, get_logits_processor
-from ...extras.ploting import plot_loss
+from ...extras.misc import get_logits_processor
 from ...model import load_model, load_tokenizer
-from ..trainer_utils import create_modelcard_and_push
-from .metric import ComputeAccuracy, ComputeSimilarity, eval_logit_processor
 from .trainer import CustomSeq2SeqTrainer
+
 
 if TYPE_CHECKING:
     from transformers import Seq2SeqTrainingArguments, TrainerCallback
 
     from ...hparams import DataArguments, FinetuningArguments, GeneratingArguments, ModelArguments
 
-import torch
 import torch.nn as nn
 
 from ...extras import logging
 
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizer, ProcessorMixin
-
     from ...hparams import FinetuningArguments, ModelArguments
 
 logger = logging.get_logger(__name__)
@@ -83,18 +77,17 @@ class TTLModel(nn.Module):
         )
 
     def forward(self, train_batch, predict_batch):
-        if self.finetuning_args.setting == "offline_ttl":
+        if self.finetuning_args.ttl_setting == "offline_ttl":
             self.forward_for_offline(train_batch=train_batch, predict_batch=predict_batch)
 
-        elif self.finetuning_args.setting == "online_ttl":
+        elif self.finetuning_args.ttl_setting == "online_ttl":
             self.forward_for_online(train_batch=train_batch, predict_batch=predict_batch)
 
         else:
-            raise ValueError(f"NO such setting: {self.finetuning_args.setting}")
+            raise ValueError(f"NO such setting: {self.finetuning_args.ttl_setting}")
 
     def forward_for_offline(self, train_batch, predict_batch):
-        """
-        First Train, then Predict.
+        """First Train, then Predict.
         This is the offline TTL setting, where we first train the model using only the inputs, then use the trained model to predict the results of the training data.
         """
         # train
@@ -184,7 +177,7 @@ def run_ttl(
     training_args: "Seq2SeqTrainingArguments",
     finetuning_args: "FinetuningArguments",
     generating_args: "GeneratingArguments",
-    callbacks: Optional[List["TrainerCallback"]] = None,
+    callbacks: Optional[list["TrainerCallback"]] = None,
 ):
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
@@ -193,7 +186,14 @@ def run_ttl(
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
     train_dataset = dataset_module["train_dataset"]
-    eval_dataset = dataset_module["eval_dataset"]
+    try:
+        eval_dataset = dataset_module["eval_dataset"]
+        if eval_dataset is None or len(eval_dataset) == 0:
+            logger.warning("eval_dataset is empty, using train_dataset as eval_dataset.")
+            eval_dataset = train_dataset
+    except Exception as e:
+        logger.warning(f"Failed to load eval_dataset, using train_dataset instead. Error: {e}")
+        eval_dataset = train_dataset
     print(train_dataset, eval_dataset)
     print(train_dataset[0], "\n", eval_dataset[0])
 
@@ -208,9 +208,9 @@ def run_ttl(
         model=model,
     )
 
-    if finetuning_args.setting == "offline_ttl":
+    if finetuning_args.ttl_setting == "offline_ttl":
         ttl_model.forward(train_batch=train_dataset, predict_batch=eval_dataset)
-    elif finetuning_args.setting == "online_ttl":
+    elif finetuning_args.ttl_setting == "online_ttl":
         streaming_batch_size = finetuning_args.streaming_batch_size
         num_of_batch = len(train_dataset) // streaming_batch_size
         if len(train_dataset) % streaming_batch_size != 0:
@@ -227,4 +227,4 @@ def run_ttl(
             sub_evalset = eval_dataset.select(range(k * streaming_batch_size, end_index))
             ttl_model.forward(train_batch=sub_trainset, predict_batch=sub_evalset)
     else:
-        raise ValueError(f"NO such setting: {finetuning_args.setting}")
+        raise ValueError(f"NO such setting: {finetuning_args.ttl_setting}")
