@@ -17,6 +17,7 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from tqdm.auto import tqdm
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
 from ...extras.constants import IGNORE_INDEX
@@ -115,6 +116,95 @@ def _predict_and_save_jsonl(trainer: TTLTrainer, dataset, tokenizer, out_dir: st
     logger.info_rank0(f"Saved prediction results to {out_file}")
 
 
+def _precompute_reference_ce(
+    trainer: TTLTrainer,
+    dataset,
+    batch_size: int,
+    log_path: Optional[str] = None,
+) -> None:
+    """在 workflow 中执行参考 CE 的预计算：用 Trainer 的 eval dataloader 遍历 dataset，
+    写入 trainer.ref_sentence_ce。"""
+    from contextlib import nullcontext as _nullctx
+    from tqdm.auto import tqdm
+
+    assert hasattr(trainer, "data_collator"), "TTLTrainer 需要 data_collator 才能预计算参考 CE。"
+    model = trainer.model
+    model.eval()
+
+    # 关键：使用 Trainer 自带的 DataLoader，自动携带 collator、分布式采样器、pin_memory 等设置
+    dataloader = trainer.get_eval_dataloader(dataset)
+
+    # 若是 PEFT/LoRA，关闭 adapter，用基座权重前向
+    base_model_ctx = getattr(trainer.accelerator.unwrap_model(model), "disable_adapter", None)
+    base_ctx = base_model_ctx() if base_model_ctx is not None else _nullctx()
+
+    trainer.ref_sentence_ce = {}
+    total_seen = 0
+
+    # 只在主进程显示进度条
+    show_bar = trainer.is_world_process_zero()
+    pbar = None
+    total_examples = None
+    if show_bar:
+        try:
+            total_examples = len(dataset)
+        except Exception:
+            total_examples = None
+
+        if total_examples is not None:
+            pbar = tqdm(total=total_examples, dynamic_ncols=True, unit="ex", desc="[TTL] Precompute CE", leave=True)
+        else:
+            pbar = tqdm(dynamic_ncols=True, unit="batch", desc="[TTL] Precompute CE", leave=True)
+
+    with base_ctx, torch.no_grad():
+        for batch in dataloader:
+            # 与训练一致：张量放到当前设备
+            input_ids = batch["input_ids"].to(model.device)
+            attn = batch.get("attention_mask", None)
+            if attn is not None:
+                attn = attn.to(model.device)
+
+            outputs = model(input_ids=input_ids, attention_mask=attn)
+            logits = outputs["logits"]
+
+            # 与训练一致：用 attention_mask 屏蔽 pad，并屏蔽句首
+            labels_eff = input_ids.clone()
+            if attn is not None:
+                labels_eff = labels_eff.masked_fill(attn == 0, IGNORE_INDEX)
+            labels_eff[:, 0] = IGNORE_INDEX
+
+            ce = trainer._cal_ce(logits, labels_eff)  # [B]
+
+            ex_ids = batch["example_id"]
+            if isinstance(ex_ids, torch.Tensor):
+                ex_ids = ex_ids.tolist()
+
+            for eid, val in zip(ex_ids, ce.detach().cpu().tolist()):
+                trainer.ref_sentence_ce[int(eid)] = float(val)
+
+            # 进度条更新
+            batch_size_now = len(ex_ids)
+            total_seen += batch_size_now
+            if pbar is not None:
+                if total_examples is not None:
+                    left = max(total_examples - total_seen, 0)
+                    pbar.update(batch_size_now)
+                    pbar.set_postfix({"seen": total_seen, "left": left, "bs": batch_size_now})
+                else:
+                    pbar.update(1)
+                    pbar.set_postfix({"seen": total_seen, "bs": batch_size_now})
+
+    if pbar is not None:
+        pbar.close()
+
+    if log_path is not None and trainer.is_world_process_zero():
+        trainer._log_path = log_path
+        with open(trainer._log_path, "a", encoding="utf-8") as f:
+            print(f"[TTL] Precomputed reference CE for {total_seen} samples.", file=f)
+
+    model.train()
+
+
 def run_ttlu(
     model_args: "ModelArguments",
     data_args: "DataArguments",
@@ -154,8 +244,9 @@ def run_ttlu(
     training_args.remove_unused_columns = False  # 防止删掉 example_id
     base_collator = SFTDataCollatorWith4DAttentionMask(
         template=template,
-        model=model,
-        pad_to_multiple_of=8 if training_args.do_train else None,
+        # model=model,  # 与官方对齐，这里不强行注入 model
+        # pad_to_multiple_of=8 if training_args.do_train else None,
+        pad_to_multiple_of=None,
         label_pad_token_id=(IGNORE_INDEX if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id),
         block_diag_attn=model_args.block_diag_attn,
         attn_implementation=getattr(model.config, "_attn_implementation", None),
@@ -179,7 +270,8 @@ def run_ttlu(
     # 若需要，预计算参考 CE（一次性，用 base 模型；无需维护两份权重）
     if getattr(finetuning_args, "ttl_ref_mode", "precompute") == "precompute":
         log_path = os.path.join(training_args.output_dir, "ttl_log.txt")
-        trainer.precompute_reference_ce(
+        _precompute_reference_ce(
+            trainer=trainer,
             dataset=train_dataset,
             batch_size=int(getattr(finetuning_args, "ttl_ref_batch_size", 64)),
             log_path=log_path,

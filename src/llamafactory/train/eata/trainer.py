@@ -31,6 +31,12 @@ class EataTrainer(Seq2SeqTrainer):
         self.finetuning_args = finetuning_args
         self.eata_mt = None  # moving average for S_div(x)
         self.token_log: List[List[Dict[str, Union[str, float]]]] = []
+        if hasattr(self, "processing_class") and self.processing_class is not None:
+            try:
+                self.processing_class.padding_side = "left"
+                logger.info_rank0("Set tokenizer padding_side='left' for FlashAttention compatibility.")
+            except Exception as e:
+                logger.warning_rank0(f"Could not set padding_side: {e}")
 
     @override
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):

@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
-from tqdm.auto import tqdm
 from transformers import Seq2SeqTrainer
 from typing_extensions import override
 
@@ -27,8 +26,6 @@ from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
 
 
 if TYPE_CHECKING:
-    from torch.utils.data import Dataset
-
     from ...hparams import FinetuningArguments
 
 logger = get_logger(__name__)
@@ -44,7 +41,7 @@ class TTLTrainer(Seq2SeqTrainer):
       - 权重: ttl_sample_efficiency_scaler * exp(sentence_ce - ttl_threshold)
       - 归约: 被选样本上求平均；若一个都没选到，退化为简单平均（与官方等价）。
     参考分布两种模式：
-      - ttl_ref_mode="precompute": 训练前一次性用 base model 计算并缓存每样本 CE；
+      - ttl_ref_mode="precompute": 训练前一次性用 base model 计算并缓存每样本 CE（由 workflow 负责遍历与缓存）；
       - ttl_ref_mode="simultaneous": 训练时用当前模型即时计算 CE。
     """
 
@@ -58,6 +55,7 @@ class TTLTrainer(Seq2SeqTrainer):
         self.finetuning_args = finetuning_args
 
         # 预计算的参考 sentence CE：dict[example_id] -> float (cpu)
+        # 由 workflow 在训练开始前填充，不在 Trainer 内部构建 dataloader。
         self.ref_sentence_ce: Optional[dict[int, float]] = None
 
         # 训练阶段的样本级日志（可选）
@@ -75,106 +73,6 @@ class TTLTrainer(Seq2SeqTrainer):
         create_custom_scheduler(self.args, num_training_steps, optimizer)
         return super().create_scheduler(num_training_steps, optimizer)
 
-    # ------------------------ 参考 CE 预计算 ------------------------- #
-    @torch.no_grad()
-    def precompute_reference_ce(
-        self,
-        dataset: "Dataset",
-        batch_size: int,
-        log_path: Optional[str] = None,
-    ) -> None:
-        """在训练开始前，用未启用适配器的基座模型对 `dataset` 进行一次遍历，缓存每样本 CE."""
-        from torch.utils.data import DataLoader
-        from contextlib import nullcontext as _nullctx
-
-        assert hasattr(self, "data_collator"), "TTLTrainer 需要 data_collator 才能预计算参考 CE。"
-        self.model.eval()
-
-        # dataloader；必须包含 example_id（由外层 collator 包装注入）
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=self.data_collator,
-            pin_memory=getattr(self.args, "dataloader_pin_memory", True),
-            num_workers=getattr(self.args, "dataloader_num_workers", 0),
-        )
-
-        # 用基座权重进行前向：若是 PEFT/LoRA，关闭 adapter。
-        base_model_ctx = getattr(self.accelerator.unwrap_model(self.model), "disable_adapter", None)
-        base_ctx = base_model_ctx() if base_model_ctx is not None else _nullctx()
-
-        self.ref_sentence_ce = {}
-        total_seen = 0
-
-        # 只在主进程显示进度条
-        show_bar = self.is_world_process_zero()
-        pbar = None
-        # 若能拿到总样本数，用样本为单位；否则以 batch 为单位
-        total_examples = None
-        if show_bar:
-            try:
-                total_examples = len(dataset)
-            except Exception:
-                total_examples = None
-
-            if total_examples is not None:
-                pbar = tqdm(
-                    total=total_examples,
-                    dynamic_ncols=True,
-                    unit="ex",
-                    desc="[TTL] Precompute CE",
-                    leave=True,
-                )
-            else:
-                pbar = tqdm(
-                    dynamic_ncols=True,
-                    unit="batch",
-                    desc="[TTL] Precompute CE",
-                    leave=True,
-                )
-
-        with base_ctx:
-            for batch in dataloader:
-                input_ids = batch["input_ids"].to(self.model.device)
-                attn = batch.get("attention_mask", None)
-                if attn is not None:
-                    attn = attn.to(self.model.device)
-
-                outputs = self.model(input_ids=input_ids, attention_mask=attn)
-                logits = outputs["logits"]
-
-                ce = self._cal_ce(logits, input_ids)  # [B]
-                ex_ids = batch["example_id"]  # list[int] 或 tensor
-                if isinstance(ex_ids, torch.Tensor):
-                    ex_ids = ex_ids.tolist()
-
-                for eid, val in zip(ex_ids, ce.detach().cpu().tolist()):
-                    self.ref_sentence_ce[int(eid)] = float(val)
-
-                # 进度条更新
-                batch_size_now = len(ex_ids)
-                total_seen += batch_size_now
-                if pbar is not None:
-                    if total_examples is not None:
-                        left = max(total_examples - total_seen, 0)
-                        pbar.update(batch_size_now)
-                        pbar.set_postfix({"seen": total_seen, "left": left, "bs": batch_size_now})
-                    else:
-                        pbar.update(1)
-                        pbar.set_postfix({"seen": total_seen, "bs": batch_size_now})
-
-        if pbar is not None:
-            pbar.close()
-
-        if log_path is not None and self.is_world_process_zero():
-            self._log_path = log_path
-            with open(self._log_path, "a", encoding="utf-8") as f:
-                print(f"[TTL] Precomputed reference CE for {total_seen} samples.", file=f)
-
-        # 回到训练模式
-        self.model.train()
-
     # ------------------------ 核心损失实现 -------------------------- #
     @override
     def compute_loss(
@@ -184,37 +82,44 @@ class TTLTrainer(Seq2SeqTrainer):
         return_outputs: bool = False,
         num_items_in_batch=None,
     ):
-        # 强制不让模型消耗上游 labels（TTL 是自监督于输入）
+        # 不使用上游监督标签（TTL 自监督于输入）
         if "labels" in inputs:
             inputs = {k: v for k, v in inputs.items() if k != "labels"}
 
+        input_ids: torch.Tensor = inputs["input_ids"]
+        attn = inputs.get("attention_mask", None)
+
         outputs = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs.get("attention_mask", None),
+            input_ids=input_ids,
+            attention_mask=attn,
         )
         logits: torch.Tensor = outputs["logits"]  # [B, L, V]
-        input_ids: torch.Tensor = inputs["input_ids"]  # [B, L]
 
-        # 训练损失：对齐官方，用 KL(logits || one-hot(input_ids))，数值等价于 CE
-        sentence_kl = self._cal_kl(logits, input_ids)  # [B]
+        # —— 关键：屏蔽 pad 与句首 —— #
+        labels_eff = input_ids.clone()
+        if attn is not None:
+            labels_eff = labels_eff.masked_fill(attn == 0, IGNORE_INDEX)
+        labels_eff[:, 0] = IGNORE_INDEX
 
-        # 参考 CE：由参数决定来源
+        # 训练损失（与官方等价）：KL(logits || one-hot(labels_eff))
+        sentence_kl = self._cal_kl(logits, labels_eff)  # [B]
+
+        # 参考 CE 来源
         ref_mode = getattr(self.finetuning_args, "ttl_ref_mode", "precompute").lower()
         if ref_mode not in {"precompute", "simultaneous"}:
             raise ValueError(f"Unsupported ttl_ref_mode: {ref_mode}")
 
         if ref_mode == "simultaneous":
             with torch.no_grad():
-                sentence_ce = self._cal_ce(logits, input_ids)  # [B]
+                sentence_ce = self._cal_ce(logits, labels_eff)  # [B]
         else:
-            # 预计算模式：需要 example_id
             if "example_id" not in inputs:
                 raise RuntimeError(
                     "ttl_ref_mode=precompute 需要 batch 中包含 example_id；"
                     "请在 workflow 中为数据集添加该字段，并用包装 collator 传递。"
                 )
             if self.ref_sentence_ce is None:
-                raise RuntimeError("参考 CE 尚未预计算，请先调用 precompute_reference_ce。")
+                raise RuntimeError("参考 CE 尚未预计算，请先在 workflow 中完成预计算并设置 trainer.ref_sentence_ce。")
             ex_ids = inputs["example_id"]
             if isinstance(ex_ids, torch.Tensor):
                 ex_ids = ex_ids.tolist()
@@ -224,7 +129,7 @@ class TTLTrainer(Seq2SeqTrainer):
                 device=logits.device,
             )
 
-        # gating 与权重（对齐官方）
+        # gating 与权重
         threshold = float(getattr(self.finetuning_args, "ttl_threshold", 3.0))
         scaler = float(getattr(self.finetuning_args, "ttl_sample_efficiency_scaler", 0.1))
 
