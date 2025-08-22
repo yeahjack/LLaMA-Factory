@@ -515,49 +515,58 @@ class FinetuningArguments(
     )
     # TTL 训练模式：离线(先训后推) 或 在线(分片先推再训)
     ttl_setting: str = field(
-        default="offline_ttl",
-        metadata={"choices": ["offline_ttl", "online_ttl"],
-                  "help": "TTL training setting."}
+        default="offline_ttl", metadata={"choices": ["offline_ttl", "online_ttl"], "help": "TTL training setting."}
     )
 
     # 参考分布来源：训练前一次性用基座模型预计算，或训练时用当前模型即时计算
     ttl_ref_mode: str = field(
         default="precompute",
-        metadata={"choices": ["precompute", "simultaneous"],
-                  "help": "Reference CE source for gating."}
+        metadata={"choices": ["precompute", "simultaneous"], "help": "Reference CE source for gating."},
     )
 
     # 预计算参考 CE 时的 batch size（仅在 ttl_ref_mode=precompute 时使用）
-    ttl_ref_batch_size: int = field(
-        default=64,
-        metadata={"help": "Batch size for precomputing reference CE."}
-    )
+    ttl_ref_batch_size: int = field(default=64, metadata={"help": "Batch size for precomputing reference CE."})
 
     # 是否在 TTL 阶段直接做推理（生成并落盘），false 则仅训练并保存 LoRA
     ttl_direct_inference: bool = field(
-        default=False,
-        metadata={"help": "Run generation during TTL and save predictions."}
+        default=False, metadata={"help": "Run generation during TTL and save predictions."}
     )
 
     # 样本筛选阈值（对 sentence-level cross-entropy 比较）
-    ttl_threshold: float = field(
-        default=3.0,
-        metadata={"help": "Threshold on sentence CE for sample gating."}
-    )
+    ttl_threshold: float = field(default=3.0, metadata={"help": "Threshold on sentence CE for sample gating."})
 
     # 样本权重系数：coef = scaler * exp(CE - threshold)
     ttl_sample_efficiency_scaler: float = field(
-        default=0.1,
-        metadata={"help": "Scaler for exp(CE - threshold) weighting."}
+        default=0.1, metadata={"help": "Scaler for exp(CE - threshold) weighting."}
     )
 
     # 在线 TTL 的流式分片大小（每次处理多少条样本）
-    ttl_streaming_batch_size: int = field(
-        default=100,
-        metadata={"help": "Streaming batch size for online TTL."}
-    )
+    ttl_streaming_batch_size: int = field(default=100, metadata={"help": "Streaming batch size for online TTL."})
     generation_len: int = field(
         default=80, metadata={"help": "The number of tokens to generate for entropy calculation."}
+    )
+    # 为 TENT/EATA 指定生成来源：同时更新的当前模型，或预计算结果文件
+    gen_model: Literal["simultaneous", "precompute"] = field(
+        default="simultaneous",
+        metadata={
+            "choices": ["simultaneous", "precompute"],
+            "help": (
+                "Which source to use for the generated continuation during TENT/EATA. "
+                "'simultaneous' uses the current (updating) model; "
+                "'precompute' loads continuations from jsonl files under `precompute_results`."
+            ),
+        },
+    )
+
+    # 预计算结果目录（形如 results_{model}/base_sys/prompt/），其中包含 {dataset_name}.jsonl，行内含 'predict' 字段
+    precompute_results: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Directory containing precomputed {dataset_name}.jsonl files with a 'predict' field "
+                "used when gen_model='precompute'. If None, the caller should pass it explicitly."
+            )
+        },
     )
     use_full_entropy_in_generation: bool = field(
         default=False,
@@ -638,7 +647,6 @@ class FinetuningArguments(
         default=0.1,
         metadata={"help": "Weight for KL regularization loss. Only effective when use_kl_regularization=True."},
     )
-
 
     def __post_init__(self):
         def split_arg(arg):

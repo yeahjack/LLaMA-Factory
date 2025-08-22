@@ -27,10 +27,16 @@ class EataTrainer(Seq2SeqTrainer):
         *args,
         **kwargs,
     ):
+        # 接收预计算续写与模式
+        self.precomputed_predictions: Optional[List[List[int]]] = kwargs.pop("precomputed_predictions", None)
+        self.gen_model_mode: str = kwargs.pop("gen_model_mode", getattr(finetuning_args, "gen_model", "simultaneous"))
+
         super().__init__(*args, **kwargs)
         self.finetuning_args = finetuning_args
         self.eata_mt = None  # moving average for S_div(x)
         self.token_log: List[List[Dict[str, Union[str, float]]]] = []
+        self._precompute_ptr: int = 0
+
         if hasattr(self, "processing_class") and self.processing_class is not None:
             try:
                 self.processing_class.padding_side = "left"
@@ -38,41 +44,107 @@ class EataTrainer(Seq2SeqTrainer):
             except Exception as e:
                 logger.warning_rank0(f"Could not set padding_side: {e}")
 
+    def _pad_and_stack(self, sequences: List[List[int]], pad_id: int, device, dtype) -> torch.Tensor:
+        """
+        Pad a list of token id lists to a tensor [B, Lmax] with pad_id.
+        If sequences is empty, return an empty 2D tensor with correct dtype/device.
+        """
+        bsz = len(sequences)
+        max_len = max((len(s) for s in sequences), default=0)
+        if max_len == 0:
+            return torch.full((bsz, 0), pad_id, dtype=dtype, device=device)
+        out = torch.full((bsz, max_len), pad_id, dtype=dtype, device=device)
+        for i, s in enumerate(sequences):
+            if len(s) > 0:
+                out[i, : len(s)] = torch.tensor(s, dtype=dtype, device=device)
+        return out
+
+    def _get_pad_eos_ids(self):
+        pad_id = getattr(self.processing_class, "pad_token_id", None)
+        eos_id = getattr(self.processing_class, "eos_token_id", None)
+        if pad_id is None and hasattr(self, "tokenizer") and self.tokenizer is not None:
+            pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if eos_id is None and hasattr(self, "tokenizer") and self.tokenizer is not None:
+            eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        if pad_id is None:
+            pad_id = 0
+        if eos_id is None:
+            eos_id = 0
+        return pad_id, eos_id
+
     @override
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Step 1: Generate output tokens
+        # Step 1: Generate or build output tokens
         self.model.eval()
+        pad_id, eos_id = self._get_pad_eos_ids()
+
         with torch.no_grad():
-            if self.finetuning_args.generation_len > 0:
-                generated_tokens = self.model.generate(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    max_new_tokens=self.finetuning_args.generation_len,
-                    pad_token_id=self.processing_class.pad_token_id,
-                    eos_token_id=self.processing_class.eos_token_id,
-                    do_sample=False,
-                    top_k=None,
-                    top_p=None,
-                    temperature=1.0,
+            if self.finetuning_args.generation_len != 0:
+                # 预计算模式：直接拼接续写；否则用当前模型生成
+                use_precompute = (
+                    getattr(self, "gen_model_mode", getattr(self.finetuning_args, "gen_model", "simultaneous"))
+                    == "precompute"
+                    and self.precomputed_predictions is not None
                 )
+
+                if self.finetuning_args.generation_len == -1:
+                    max_tokens = 2048  # 动态上限；模型可遇 EOS 早停
+                else:
+                    max_tokens = self.finetuning_args.generation_len
+
+                if use_precompute:
+                    bsz = inputs["input_ids"].size(0)
+                    cont_list: List[List[int]] = []
+                    for _ in range(bsz):
+                        if self._precompute_ptr < len(self.precomputed_predictions):
+                            seq = self.precomputed_predictions[self._precompute_ptr]
+                            self._precompute_ptr += 1
+                        else:
+                            seq = []
+                        if self.finetuning_args.generation_len is not None and self.finetuning_args.generation_len > 0:
+                            seq = seq[: self.finetuning_args.generation_len]
+                        cont_list.append(seq)
+
+                    cont_tensor = self._pad_and_stack(
+                        cont_list,
+                        pad_id=pad_id,
+                        device=inputs["input_ids"].device,
+                        dtype=inputs["input_ids"].dtype,
+                    )
+                    generated_tokens = torch.cat([inputs["input_ids"], cont_tensor], dim=1)
+                else:
+                    generated_tokens = self.model.generate(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs.get("attention_mask", None),
+                        max_new_tokens=max_tokens,
+                        pad_token_id=pad_id,
+                        eos_token_id=eos_id,
+                        do_sample=False,
+                        top_k=None,
+                        top_p=None,
+                        temperature=1.0,
+                    )
+                prompt_len = inputs["input_ids"].size(1)
             else:
                 generated_tokens = inputs["input_ids"]
+                prompt_len = 0
         self.model.train()
 
         # Step 2: Forward pass on generated tokens
         outputs: CausalLMOutput = self.model(input_ids=generated_tokens)
         logits = outputs.logits
 
-        # Step 3: Get logits and tokens for loss calculation
-        if self.finetuning_args.generation_len > 0 and getattr(
-            self.finetuning_args, "use_full_entropy_in_generation", False
-        ):
-            target_logits = logits[:, :-1, :]  # [B, L_full-1, V]
-            target_tokens = generated_tokens[:, 1:]  # [B, L_full-1]
+        # Step 3: Get logits and tokens for loss calculation（与 TENT 对齐的切片规则）
+        if self.finetuning_args.generation_len != 0:
+            if getattr(self.finetuning_args, "use_full_entropy_in_generation", False):
+                target_logits = logits[:, :-1, :]  # [B, L_full-1, V]
+                target_tokens = generated_tokens[:, 1:]  # [B, L_full-1]
+            else:
+                target_logits = logits[:, prompt_len - 1 : -1, :]  # [B, L_gen, V]
+                target_tokens = generated_tokens[:, prompt_len:]  # [B, L_gen]
         else:
-            prompt_len = inputs["input_ids"].size(1)
-            target_logits = logits[:, prompt_len - 1 : -1, :]  # [B, L_gen, V]
-            target_tokens = generated_tokens[:, prompt_len:]  # [B, L_gen]
+            target_logits = logits[:, :-1, :]
+            target_tokens = generated_tokens[:, 1:]
 
         # Step 4: Token-wise entropy
         probs = torch.nn.functional.softmax(target_logits, dim=-1)
@@ -80,7 +152,7 @@ class EataTrainer(Seq2SeqTrainer):
         entropy = -torch.sum(probs * log_probs, dim=-1)  # [B, L]
 
         # Step 5: Mask padding and compute sequence-level entropy
-        entropy_mask = (target_tokens != self.processing_class.pad_token_id).float()  # [B, L]
+        entropy_mask = (target_tokens != pad_id).float()  # [B, L]
         token_entropy = (entropy * entropy_mask).sum(dim=-1) / (entropy_mask.sum(dim=-1) + 1e-8)  # [B]
 
         if self.is_in_train and target_tokens.numel() > 0:
@@ -95,13 +167,10 @@ class EataTrainer(Seq2SeqTrainer):
         # Step 6: EATA Sample Selection (S_ent)
         E0 = getattr(self.finetuning_args, "eata_entropy_threshold", 0.4)
 
-        # Choose high/low entropy samples
         if getattr(self.finetuning_args, "eata_select_high_entropy", False):
-            # 选择高熵样本进行优化 (熵越大，权重越高)
             sent_mask = (token_entropy >= E0).float()
             sent_weight = torch.exp(token_entropy - E0)
         else:
-            # 选择低熵样本进行优化 (熵越小，权重越高)
             sent_mask = (token_entropy < E0).float()
             sent_weight = torch.exp(-(token_entropy - E0))
 
