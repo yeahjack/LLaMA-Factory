@@ -122,8 +122,12 @@ def _precompute_reference_ce(
     batch_size: int,
     log_path: Optional[str] = None,
 ) -> None:
-    """在 workflow 中执行参考 CE 的预计算：用 Trainer 的 eval dataloader 遍历 dataset，
-    写入 trainer.ref_sentence_ce。"""
+    """在 workflow 中执行参考 CE 的预计算：
+    用 Trainer 的 eval dataloader 遍历 dataset，写入 trainer.ref_sentence_ce。
+
+    注意：这里的 batch_size 被解释为 **per-device** 的 batch 大小，
+    与 Transformers 的 `per_device_eval_batch_size` 含义一致。
+    """
     from contextlib import nullcontext as _nullctx
     from tqdm.auto import tqdm
 
@@ -131,8 +135,18 @@ def _precompute_reference_ce(
     model = trainer.model
     model.eval()
 
-    # 关键：使用 Trainer 自带的 DataLoader，自动携带 collator、分布式采样器、pin_memory 等设置
-    dataloader = trainer.get_eval_dataloader(dataset)
+    # 临时覆盖 per_device_eval_batch_size，让 get_eval_dataloader 使用 ttl_ref_batch_size ===
+    old_pdev_bs = getattr(trainer.args, "per_device_eval_batch_size", None)
+    try:
+        # 保底处理，把传入的 batch_size 规范为 >=1 的 int
+        trainer.args.per_device_eval_batch_size = max(1, int(batch_size))
+        # 使用 Trainer 自带的 DataLoader（带分布式采样器、pin_memory 等）
+        dataloader = trainer.get_eval_dataloader(dataset)
+        if trainer.is_world_process_zero():
+            logger.info(f"[TTL] Precompute CE per-device batch size set to {trainer.args.per_device_eval_batch_size}.")
+    finally:
+        if old_pdev_bs is not None:
+            trainer.args.per_device_eval_batch_size = old_pdev_bs
 
     # 若是 PEFT/LoRA，关闭 adapter，用基座权重前向
     base_model_ctx = getattr(trainer.accelerator.unwrap_model(model), "disable_adapter", None)
@@ -158,7 +172,6 @@ def _precompute_reference_ce(
 
     with base_ctx, torch.no_grad():
         for batch in dataloader:
-            # 与训练一致：张量放到当前设备
             input_ids = batch["input_ids"].to(model.device)
             attn = batch.get("attention_mask", None)
             if attn is not None:
@@ -167,7 +180,6 @@ def _precompute_reference_ce(
             outputs = model(input_ids=input_ids, attention_mask=attn)
             logits = outputs["logits"]
 
-            # 与训练一致：用 attention_mask 屏蔽 pad，并屏蔽句首
             labels_eff = input_ids.clone()
             if attn is not None:
                 labels_eff = labels_eff.masked_fill(attn == 0, IGNORE_INDEX)
@@ -182,7 +194,6 @@ def _precompute_reference_ce(
             for eid, val in zip(ex_ids, ce.detach().cpu().tolist()):
                 trainer.ref_sentence_ce[int(eid)] = float(val)
 
-            # 进度条更新
             batch_size_now = len(ex_ids)
             total_seen += batch_size_now
             if pbar is not None:
