@@ -54,7 +54,7 @@ LAUNCH_DELAY_SECONDS=1
 # =========== TTL 设置（与 YAML 对齐，使用列表进行组合实验） ===========
 TTL_SETTING_LIST=("offline_ttl")
 TTL_REF_MODE_LIST=("precompute" "simultaneous")
-TTL_REF_BATCH_SIZE_LIST=(32)
+TTL_REF_BATCH_SIZE_LIST=(1)
 TTL_ENABLE_INFERENCE_LIST=("false")
 TTL_THRESHOLD_LIST=(3)
 TTL_SCALER_LIST=(0.1)
@@ -63,11 +63,11 @@ TTL_STREAMING_BATCH_SIZE_LIST=(100)
 # =========== 实验变量配置 ===========
 methods=(
   # "base"   # 仅推理；不使用LoRA；结果保存到 <RESULTS_BASE_DIR>/base
-  # "ttlu"
+  "ttlu"
   # "ttl"
-  "tent"
-  "eata"
-  "eata_sdiv"
+  # "tent"
+  # "eata"
+  # "eata_sdiv"
   # "ttltent"
   # "ttltent_ppl_nll"
   # "ttltent_nll_nll"
@@ -75,12 +75,12 @@ methods=(
 )
 
 generation_lens=(
-  # 0
+  0
   # 1
-  4
-  8
-  16
-  32
+  # 4
+  # 8
+  # 16
+  # 32
   # 64
   # -1
   # 80
@@ -116,6 +116,31 @@ gpus=(
   4
 )
 
+# ===== LoRA 目标组合：新增维度（attn | ffn | attn_ffn）=====
+LORA_TARGET_MODE_LIST=(
+  "attn" 
+  "ffn" 
+  "attn_ffn"
+  )
+# 说明：映射到具体 target 名（适配 Qwen2.5 命名）
+resolve_lora_target() {
+  case "$1" in
+    "attn") echo "q_proj,v_proj" ;;
+    "ffn") echo "up_proj,down_proj,gate_proj" ;;
+    "attn_ffn") echo "q_proj,v_proj,up_proj,down_proj,gate_proj" ;;
+    *) echo "$1" ;; # 允许直接传自定义 target 字符串
+  esac
+}
+# LoRA 标签后缀（用于 run_name / 日志 / 目录等）
+lora_suffix_for() {
+  local method="$1"
+  if [[ "$method" == "base" ]]; then
+    echo ""
+  else
+    echo "_${LORA_TARGET_MODE}"
+  fi
+}
+
 # ===== 将关键开关改为“列表 + 迭代”，方便做 ablation =====
 USE_FULL_ENTROPY_IN_GENERATION_LIST=("false")
 # ✅ 注意：bash 数组不要用逗号分隔；逗号会进入元素本身
@@ -138,6 +163,7 @@ LOSS_BALANCING_METHOD="${LOSS_BALANCING_METHOD_LIST[0]}"
 ALTERNATING_TRAINING="${ALTERNATING_TRAINING_LIST[0]}"
 USE_KL_REGULARIZATION="${USE_KL_REGULARIZATION_LIST[0]}"
 KL_WEIGHT="${KL_WEIGHT_LIST[0]}"
+DEFAULT_LORA_TARGET_MODE="${LORA_TARGET_MODE_LIST[0]}"
 
 # =========== 日志根目录按日期分组 ===========
 LOG_DATE="$(date +%F)"
@@ -221,7 +247,7 @@ get_stage_for_method() {
   fi
 }
 
-# 后缀（仅对有生成维度的方法添加与生成相关的后缀）
+# 后缀（仅对有生成维度的方法添加与生成相关的后缀，并附加 LoRA 目标）
 get_suffix() {
   local method="$1"
   local gen_len="$2"
@@ -254,6 +280,11 @@ get_suffix() {
     if [[ "${USE_KL_REGULARIZATION}" == "true" ]]; then suffix+="_kl${KL_WEIGHT}"; else suffix+="_nokl"; fi
   fi
 
+  # LoRA 目标后缀（base 方法不附加）
+  if [[ "${method}" != "base" ]]; then
+    suffix+="$(lora_suffix_for "${method}")"
+  fi
+
   echo "${suffix}"
 }
 
@@ -261,10 +292,11 @@ get_suffix() {
 get_exp_tag_for_method() {
   local method="$1"
   local sc; sc="$(sanitize_tag "${TTL_SCALER}")"
+  local lora_sfx; lora_sfx="$(lora_suffix_for "${method}")"  # "" for base, "_ffn"/"_attn_ffn" for others
   if method_is_ttlu_like "${method}"; then
-    echo "ttlu-${TTL_SETTING}_${TTL_REF_MODE}_thr${TTL_THRESHOLD}_sc${sc}"
+    echo "ttlu-${TTL_SETTING}_${TTL_REF_MODE}_thr${TTL_THRESHOLD}_sc${sc}${lora_sfx}"
   elif method_is_ttl_only "${method}"; then
-    echo "ttl-${TTL_SETTING}_thr${TTL_THRESHOLD}_sc${sc}"
+    echo "ttl-${TTL_SETTING}_thr${TTL_THRESHOLD}_sc${sc}${lora_sfx}"
   else
     echo ""
   fi
@@ -292,10 +324,15 @@ method_dir_name() {
 }
 dataset_key() {
   local method="$1" gen_len="$2" dataset="$3"
+  local tag=""
+  # base 方法不附加 LoRA 标签
+  if [[ "${method}" != "base" ]]; then
+    tag="$(lora_suffix_for "${method}")"
+  fi
   if method_has_gen_dim "${method}"; then
-    echo "${dataset}_${gen_len}"
+    echo "${dataset}_${gen_len}${tag}"
   else
-    echo "${dataset}"
+    echo "${dataset}${tag}"
   fi
 }
 save_root_for_method() {
@@ -349,7 +386,8 @@ run_train() {
   fi
 
   local out_dir; out_dir="$(adapter_dir "${method}" "${gen_len}" "${dataset}")"
-  local run_name="${dataset}_$(method_dir_name "${method}" "${gen_len}")"
+  local lora_sfx; lora_sfx="$(lora_suffix_for "${method}")"
+  local run_name="${dataset}_$(method_dir_name "${method}" "${gen_len}")${lora_sfx}"
   mkdir -p "${out_dir}"
 
   local suffix; suffix="$(get_suffix "$method" "$gen_len")"
@@ -368,6 +406,10 @@ run_train() {
     "model_name_or_path=${BASE_MODEL_PATH}"
     "template=${TEMPLATE}"
   )
+
+  # 指定 LoRA 目标（覆盖 YAML 中的 lora_target）
+  local lora_target_str; lora_target_str="$(resolve_lora_target "${LORA_TARGET_MODE}")"
+  train_args+=("lora_target=${lora_target_str}")
 
   # 仅 ttl/ttlu 注入 TTL 参数；ttlu 额外注入 ref_* 配置；非 TTL 方法不出现任何 ttl_* 参数
   if [[ "${stage_to_run}" == "ttl" || "${stage_to_run}" == "ttlu" ]]; then
@@ -432,7 +474,8 @@ run_infer() {
   fi
 
   local res_dir; res_dir="$(results_dir "${method}" "${gen_len}")"
-  local res_file="${res_dir}/${dataset}.jsonl"
+  local dkey; dkey="$(dataset_key "${method}" "${gen_len}" "${dataset}")"
+  local res_file="${res_dir}/${dkey}.jsonl"
   local adapter_path=""
 
   if [[ "$method" == "base" ]]; then
@@ -483,8 +526,9 @@ run_eval() {
   local method="$1" dataset="$2" gen_len="$3" gpu_id="$4"
 
   local res_dir; res_dir="$(results_dir "${method}" "${gen_len}")"
-  local input_file="${res_dir}/${dataset}.jsonl"
-  local output_file="${res_dir}/${dataset}_metrics.json"
+  local dkey; dkey="$(dataset_key "${method}" "${gen_len}" "${dataset}")"
+  local input_file="${res_dir}/${dkey}.jsonl"
+  local output_file="${res_dir}/${dkey}_metrics.json"
 
   if [[ "$method" == "base" ]]; then
     input_file="${RESULTS_BASE_DIR}/base/${dataset}.jsonl"
@@ -503,12 +547,12 @@ run_eval() {
 
   (
     {
-      echo "==> [GPU ${gpu_id}] 启动评估: ${dataset} @ $(method_dir_name "${method}" "${gen_len}")"
+      echo "==> [GPU ${gpu_id}] 启动评估: ${dkey} @ $(method_dir_name "${method}" "${gen_len}")"
       echo "+ CUDA_VISIBLE_DEVICES=\"${gpu_id}\" python scripts/eval_ttl_aligned.py --filename \"${input_file}\" --output_filename \"${output_file}\" --metrics bertscore,rouge,bleu,em"
       CUDA_VISIBLE_DEVICES="${gpu_id}" python scripts/eval_ttl_aligned.py \
         --filename "${input_file}" --output_filename "${output_file}" \
         --metrics "bertscore,rouge,bleu,em"
-      echo "==> [GPU ${gpu_id}] 完成评估: ${dataset}"
+      echo "==> [GPU ${gpu_id}] 完成评估: ${dkey}"
     } 2>&1 | tee "${log_file}"
   ) &
 }
@@ -532,6 +576,8 @@ hydrate_task_env() {
   ALTERNATING_TRAINING="${tasks_alternating_training[idx]}"
   USE_KL_REGULARIZATION="${tasks_use_kl_regularization[idx]}"
   KL_WEIGHT="${tasks_kl_weight[idx]}"
+
+  LORA_TARGET_MODE="${tasks_lora_target_mode[idx]}"
 }
 
 # ========= 全局任务调度（单阶段，跨所有组合排队） =========
@@ -578,7 +624,7 @@ execute_stage_globally() {
         ;;
       "infer")
         local rdir; rdir="$(results_dir "${method}" "${len}")"
-        local ifile="${rdir}/${dataset}.jsonl"
+        local ifile="${rdir}/$(dataset_key "${method}" "${len}" "${dataset}").jsonl"
         if [[ ! -f "${ifile}" ]]; then
           should_run=true
         else
@@ -587,7 +633,7 @@ execute_stage_globally() {
         ;;
       "eval")
         local rdir; rdir="$(results_dir "${method}" "${len}")"
-        local efile="${rdir}/${dataset}_metrics.json"
+        local efile="${rdir}/$(dataset_key "${method}" "${len}" "${dataset}")_metrics.json"
         if [[ ! -f "${efile}" ]]; then
           should_run=true
         else
@@ -736,6 +782,7 @@ for MODEL_KEY in "${models[@]}"; do
   DEFAULT_ALTERNATING_TRAINING="${ALTERNATING_TRAINING_LIST[0]}"
   DEFAULT_USE_KL_REGULARIZATION="${USE_KL_REGULARIZATION_LIST[0]}"
   DEFAULT_KL_WEIGHT="${KL_WEIGHT_LIST[0]}"
+  DEFAULT_LORA_TARGET_MODE="${LORA_TARGET_MODE_LIST[0]}"
 
   echo ">>> 准备数据集列表，交错排列以优化GPU分配..."
   rb_datasets=()
@@ -762,6 +809,7 @@ for MODEL_KEY in "${models[@]}"; do
   tasks_use_full_entropy=(); tasks_eata_select_high_entropy=(); tasks_use_emft_loss=()
   tasks_gen_model=(); tasks_loss_balancing_method=(); tasks_alternating_training=()
   tasks_use_kl_regularization=(); tasks_kl_weight=()
+  tasks_lora_target_mode=()
 
   for TTL_SETTING in "${TTL_SETTING_LIST[@]}"; do
     for TTL_REF_MODE in "${TTL_REF_MODE_LIST[@]}"; do
@@ -778,93 +826,101 @@ for MODEL_KEY in "${models[@]}"; do
                           for ALTERNATING_TRAINING in "${ALTERNATING_TRAINING_LIST[@]}"; do
                             for USE_KL_REGULARIZATION in "${USE_KL_REGULARIZATION_LIST[@]}"; do
                               for KL_WEIGHT in "${KL_WEIGHT_LIST[@]}"; do
-                                tasks_pushed=0
-                                for method in "${methods[@]}"; do
-                                  for len in "${generation_lens[@]}"; do
-                                    # 纯“无生成”方法不展开非零 len（ttl/ttlu/sft/nll*/ppl*）
-                                    if method_is_pure_nogen "${method}" && [[ "${len}" -ne 0 ]]; then
+                                for LORA_TARGET_MODE in "${LORA_TARGET_MODE_LIST[@]}"; do
+                                  tasks_pushed=0
+                                  for method in "${methods[@]}"; do
+                                    # 对 base 方法，仅保留默认 LoRA 目标（base 本身不会用到）
+                                    if [[ "${method}" == "base" && "${LORA_TARGET_MODE}" != "${DEFAULT_LORA_TARGET_MODE}" ]]; then
                                       continue
                                     fi
-
-                                    # 去重与作用域控制：
-                                    # A) ttlu 系：允许随所有 TTL 变量（含 ref_*）展开
-                                    # B) ttl：    允许随 TTL 核心变量展开，但要求 ref_* 三项为默认
-                                    # C) 非 TTL： 完全与 TTL 解耦；只在所有 TTL 变量均为默认时生成一次
-                                    if method_is_ttlu_like "${method}"; then
-                                      : # 不限
-                                    elif method_is_ttl_only "${method}"; then
-                                      if [[ "${TTL_REF_MODE}" != "${DEFAULT_TTL_REF_MODE}" \
-                                         || "${TTL_REF_BATCH_SIZE}" != "${DEFAULT_TTL_REF_BATCH_SIZE}" \
-                                         || "${TTL_ENABLE_INFERENCE}" != "${DEFAULT_TTL_ENABLE_INFERENCE}" ]]; then
+                                    for len in "${generation_lens[@]}"; do
+                                      # 纯“无生成”方法不展开非零 len（ttl/ttlu/sft/nll*/ppl*）
+                                      if method_is_pure_nogen "${method}" && [[ "${len}" -ne 0 ]]; then
                                         continue
                                       fi
-                                    else
-                                      if [[ "${TTL_SETTING}" != "${DEFAULT_TTL_SETTING}" \
-                                         || "${TTL_THRESHOLD}" != "${DEFAULT_TTL_THRESHOLD}" \
-                                         || "${TTL_SCALER}" != "${DEFAULT_TTL_SCALER}" \
-                                         || "${TTL_STREAMING_BATCH_SIZE}" != "${DEFAULT_TTL_STREAMING_BATCH_SIZE}" \
-                                         || "${TTL_REF_MODE}" != "${DEFAULT_TTL_REF_MODE}" \
-                                         || "${TTL_REF_BATCH_SIZE}" != "${DEFAULT_TTL_REF_BATCH_SIZE}" \
-                                         || "${TTL_ENABLE_INFERENCE}" != "${DEFAULT_TTL_ENABLE_INFERENCE}" ]]; then
+
+                                      # 去重与作用域控制：
+                                      # A) ttlu 系：允许随所有 TTL 变量（含 ref_*）展开
+                                      # B) ttl：    允许随 TTL 核心变量展开，但要求 ref_* 三项为默认
+                                      # C) 非 TTL： 完全与 TTL 解耦；只在所有 TTL 变量均为默认时生成一次
+                                      if method_is_ttlu_like "${method}"; then
+                                        : # 不限
+                                      elif method_is_ttl_only "${method}"; then
+                                        if [[ "${TTL_REF_MODE}" != "${DEFAULT_TTL_REF_MODE}" \
+                                           || "${TTL_REF_BATCH_SIZE}" != "${DEFAULT_TTL_REF_BATCH_SIZE}" \
+                                           || "${TTL_ENABLE_INFERENCE}" != "${DEFAULT_TTL_ENABLE_INFERENCE}" ]]; then
+                                          continue
+                                        fi
+                                      else
+                                        if [[ "${TTL_SETTING}" != "${DEFAULT_TTL_SETTING}" \
+                                           || "${TTL_THRESHOLD}" != "${DEFAULT_TTL_THRESHOLD}" \
+                                           || "${TTL_SCALER}" != "${DEFAULT_TTL_SCALER}" \
+                                           || "${TTL_STREAMING_BATCH_SIZE}" != "${DEFAULT_TTL_STREAMING_BATCH_SIZE}" \
+                                           || "${TTL_REF_MODE}" != "${DEFAULT_TTL_REF_MODE}" \
+                                           || "${TTL_REF_BATCH_SIZE}" != "${DEFAULT_TTL_REF_BATCH_SIZE}" \
+                                           || "${TTL_ENABLE_INFERENCE}" != "${DEFAULT_TTL_ENABLE_INFERENCE}" ]]; then
+                                          continue
+                                        fi
+                                      fi
+
+                                      # 新变量适用性过滤：避免在无关方法上重复组合
+                                      stage_for_m="$(get_stage_for_method "${method}")"
+                                      # 仅对有生成维度的方法允许切换 USE_FULL_ENTROPY_IN_GENERATION
+                                      if ! method_has_gen_dim "${method}" && [[ "${USE_FULL_ENTROPY_IN_GENERATION}" != "${DEFAULT_USE_FULL_ENTROPY_IN_GENERATION}" ]]; then
                                         continue
                                       fi
-                                    fi
-
-                                    # 新变量适用性过滤：避免在无关方法上重复组合
-                                    stage_for_m="$(get_stage_for_method "${method}")"
-                                    # 仅对有生成维度的方法允许切换 USE_FULL_ENTROPY_IN_GENERATION
-                                    if ! method_has_gen_dim "${method}" && [[ "${USE_FULL_ENTROPY_IN_GENERATION}" != "${DEFAULT_USE_FULL_ENTROPY_IN_GENERATION}" ]]; then
-                                      continue
-                                    fi
-                                    # ✅ 仅 eata/eata_sdiv 允许切换 EATA_SELECT_HIGH_ENTROPY
-                                    if [[ "${method}" != "eata" && "${method}" != "eata_sdiv" ]] && [[ "${EATA_SELECT_HIGH_ENTROPY}" != "${DEFAULT_EATA_SELECT_HIGH_ENTROPY}" ]]; then
-                                      continue
-                                    fi
-                                    # 仅非 sft 方法有效的 USE_EMFT_LOSS；sft 无效时固定为默认以去重
-                                    if [[ "${stage_for_m}" == "sft" && "${USE_EMFT_LOSS}" != "${DEFAULT_USE_EMFT_LOSS}" ]]; then
-                                      continue
-                                    fi
-                                    # 仅 tent/eata 家族允许切换 GEN_MODEL
-                                    if [[ "${method}" != *tent* && "${method}" != *eata* ]] && [[ "${GEN_MODEL}" != "${DEFAULT_GEN_MODEL}" ]]; then
-                                      continue
-                                    fi
-                                    # 仅 ttltent 允许切换以下四项
-                                    if [[ "${stage_for_m}" != "ttltent" ]]; then
-                                      if [[ "${LOSS_BALANCING_METHOD}" != "${DEFAULT_LOSS_BALANCING_METHOD}" \
-                                         || "${ALTERNATING_TRAINING}" != "${DEFAULT_ALTERNATING_TRAINING}" \
-                                         || "${USE_KL_REGULARIZATION}" != "${DEFAULT_USE_KL_REGULARIZATION}" \
-                                         || "${KL_WEIGHT}" != "${DEFAULT_KL_WEIGHT}" ]]; then
+                                      # ✅ 仅 eata/eata_sdiv 允许切换 EATA_SELECT_HIGH_ENTROPY
+                                      if [[ "${method}" != "eata" && "${method}" != "eata_sdiv" ]] && [[ "${EATA_SELECT_HIGH_ENTROPY}" != "${DEFAULT_EATA_SELECT_HIGH_ENTROPY}" ]]; then
                                         continue
                                       fi
-                                    fi
+                                      # 仅非 sft 方法有效的 USE_EMFT_LOSS；sft 无效时固定为默认以去重
+                                      if [[ "${stage_for_m}" == "sft" && "${USE_EMFT_LOSS}" != "${DEFAULT_USE_EMFT_LOSS}" ]]; then
+                                        continue
+                                      fi
+                                      # 仅 tent/eata 家族允许切换 GEN_MODEL
+                                      if [[ "${method}" != *tent* && "${method}" != *eata* ]] && [[ "${GEN_MODEL}" != "${DEFAULT_GEN_MODEL}" ]]; then
+                                        continue
+                                      fi
+                                      # 仅 ttltent 允许切换以下四项
+                                      if [[ "${stage_for_m}" != "ttltent" ]]; then
+                                        if [[ "${LOSS_BALANCING_METHOD}" != "${DEFAULT_LOSS_BALANCING_METHOD}" \
+                                           || "${ALTERNATING_TRAINING}" != "${DEFAULT_ALTERNATING_TRAINING}" \
+                                           || "${USE_KL_REGULARIZATION}" != "${DEFAULT_USE_KL_REGULARIZATION}" \
+                                           || "${KL_WEIGHT}" != "${DEFAULT_KL_WEIGHT}" ]]; then
+                                          continue
+                                        fi
+                                      fi
 
-                                    for dataset in "${interleaved_datasets[@]}"; do
-                                      tasks_method+=("$method")
-                                      tasks_dataset+=("$dataset")
-                                      tasks_gen_len+=("$len")
+                                      for dataset in "${interleaved_datasets[@]}"; do
+                                        tasks_method+=("$method")
+                                        tasks_dataset+=("$dataset")
+                                        tasks_gen_len+=("$len")
 
-                                      tasks_ttl_setting+=("$TTL_SETTING")
-                                      tasks_ttl_ref_mode+=("$TTL_REF_MODE")
-                                      tasks_ttl_ref_bs+=("$TTL_REF_BATCH_SIZE")
-                                      tasks_ttl_enable_infer+=("$TTL_ENABLE_INFERENCE")
-                                      tasks_ttl_threshold+=("$TTL_THRESHOLD")
-                                      tasks_ttl_scaler+=("$TTL_SCALER")
-                                      tasks_ttl_stream_bs+=("$TTL_STREAMING_BATCH_SIZE")
+                                        tasks_ttl_setting+=("$TTL_SETTING")
+                                        tasks_ttl_ref_mode+=("$TTL_REF_MODE")
+                                        tasks_ttl_ref_bs+=("$TTL_REF_BATCH_SIZE")
+                                        tasks_ttl_enable_infer+=("$TTL_ENABLE_INFERENCE")
+                                        tasks_ttl_threshold+=("$TTL_THRESHOLD")
+                                        tasks_ttl_scaler+=("$TTL_SCALER")
+                                        tasks_ttl_stream_bs+=("$TTL_STREAMING_BATCH_SIZE")
 
-                                      tasks_use_full_entropy+=("$USE_FULL_ENTROPY_IN_GENERATION")
-                                      tasks_eata_select_high_entropy+=("$EATA_SELECT_HIGH_ENTROPY")
-                                      tasks_use_emft_loss+=("$USE_EMFT_LOSS")
-                                      tasks_gen_model+=("$GEN_MODEL")
-                                      tasks_loss_balancing_method+=("$LOSS_BALANCING_METHOD")
-                                      tasks_alternating_training+=("$ALTERNATING_TRAINING")
-                                      tasks_use_kl_regularization+=("$USE_KL_REGULARIZATION")
-                                      tasks_kl_weight+=("$KL_WEIGHT")
+                                        tasks_use_full_entropy+=("$USE_FULL_ENTROPY_IN_GENERATION")
+                                        tasks_eata_select_high_entropy+=("$EATA_SELECT_HIGH_ENTROPY")
+                                        tasks_use_emft_loss+=("$USE_EMFT_LOSS")
+                                        tasks_gen_model+=("$GEN_MODEL")
+                                        tasks_loss_balancing_method+=("$LOSS_BALANCING_METHOD")
+                                        tasks_alternating_training+=("$ALTERNATING_TRAINING")
+                                        tasks_use_kl_regularization+=("$USE_KL_REGULARIZATION")
+                                        tasks_kl_weight+=("$KL_WEIGHT")
 
-                                      tasks_pushed=$((tasks_pushed+1))
+                                        tasks_lora_target_mode+=("$LORA_TARGET_MODE")
+
+                                        tasks_pushed=$((tasks_pushed+1))
+                                      done
                                     done
                                   done
+                                  (( tasks_pushed > 0 )) && echo ">>> 入队 ${tasks_pushed} 个任务（组合摘要：ttl=${TTL_SETTING}/${TTL_REF_MODE}, gen_model=${GEN_MODEL}, lora=${LORA_TARGET_MODE})"
                                 done
-                                (( tasks_pushed > 0 )) && echo ">>> 入队 ${tasks_pushed} 个任务（组合摘要：ttl=${TTL_SETTING}/${TTL_REF_MODE}, gen_model=${GEN_MODEL})"
                               done
                             done
                           done
@@ -926,6 +982,7 @@ for MODEL_KEY in "${models[@]}"; do
   tasks_use_full_entropy=(); tasks_eata_select_high_entropy=(); tasks_use_emft_loss=()
   tasks_gen_model=(); tasks_loss_balancing_method=(); tasks_alternating_training=()
   tasks_use_kl_regularization=(); tasks_kl_weight=()
+  tasks_lora_target_mode=()
 done
 
 echo "==========================================================="

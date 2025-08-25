@@ -8,11 +8,13 @@ import sys
 from io import StringIO
 import re
 import argparse
+import numpy as np
 
 
 # =========================
 #  基础：IO 与解析函数
 # =========================
+
 
 def _load_metrics_file(fp: Path) -> dict | None:
     """
@@ -82,12 +84,10 @@ _DATASET_SYNONYMS: dict[str, list[str]] = {
     "gen_med_gpt": ["gen_med_gpt", "genmedgpt", "gen-med-gpt", "genmed_gpt"],
     "agriculture": ["agriculture", "agriculture_qa", "agriculture-qa"],
     "wealth": ["wealth", "wealth_alpaca", "wealth-alpaca", "wealth_alpaca_lora", "wealth-alpaca-lora"],
-
     # ib 组
     "alpaca_gpt4": ["alpaca_gpt4", "alpaca_gpt4_en"],
     "instruction_wild": ["instruction_wild", "instructionwild"],
     "dolly": ["dolly", "dolly_15k", "dolly-15k"],
-
     # rb 组
     "gsm8k": ["gsm8k"],
     "logiqa": ["logiqa"],
@@ -109,10 +109,10 @@ _DATASET_TO_BENCHMARK: dict[str, str] = {
 }
 
 # 识别测试/验证集（仅用于决定是否考虑规模，但现在我们不再附加规模，保留此标志以便未来扩展）
-_EVAL_SPLIT_TOKENS = re.compile(r'(?:^|[/_\-])(test|valid|validation)(?:$|[/_\-])', re.IGNORECASE)
+_EVAL_SPLIT_TOKENS = re.compile(r"(?:^|[/_\-])(test|valid|validation)(?:$|[/_\-])", re.IGNORECASE)
 
 # 仅用于清理：去掉诸如末尾的 _5k / -5k（如果有的话）
-_TRAILING_SIZE = re.compile(r'([_\-])\d+\s*[kK]$')
+_TRAILING_SIZE = re.compile(r"([_\-])\d+\s*[kK]$")
 
 
 def _normalize_for_match(s: str) -> str:
@@ -120,8 +120,8 @@ def _normalize_for_match(s: str) -> str:
     统一小写；把非字母数字的分隔符统一成下划线；保留路径分隔 / 以便识别所在目录。
     """
     s = s.lower().replace("\\", "/")
-    s = re.sub(r'[^\w/]+', '_', s)          # 其他符号 → _
-    s = re.sub(r'_+', '_', s).strip('_')
+    s = re.sub(r"[^\w/]+", "_", s)  # 其他符号 → _
+    s = re.sub(r"_+", "_", s).strip("_")
     return s
 
 
@@ -136,7 +136,7 @@ def _collect_candidate_strings(fp: Path) -> list[str]:
     full = _normalize_for_match(str(fp))
     name = _normalize_for_match(fp.name)
     stem = _normalize_for_match(fp.stem)
-    stem_clean = re.sub(r'_(metrics|llm_em_summary)$', '', stem)
+    stem_clean = re.sub(r"_(metrics|llm_em_summary)$", "", stem)
 
     parents = [p.name for p in fp.parents if p != fp.anchor]
     parents = list(reversed(parents))
@@ -154,7 +154,7 @@ def _collect_candidate_strings(fp: Path) -> list[str]:
 
 def _strip_trailing_size(token: str) -> str:
     """去掉末尾的 _5k / -5k 等数量标记。"""
-    return _TRAILING_SIZE.sub('', token)
+    return _TRAILING_SIZE.sub("", token)
 
 
 def _find_dataset_base(fp: Path) -> str:
@@ -172,9 +172,9 @@ def _find_dataset_base(fp: Path) -> str:
 
     # 尝试旧式命名：db_xxx / ib_xxx / rb_xxx
     for c in candidates:
-        m = re.search(r'(^|[/_\-])(db|ib|rb)[_\-]([a-z0-9_]+)', c)
+        m = re.search(r"(^|[/_\-])(db|ib|rb)[_\-]([a-z0-9_]+)", c)
         if m:
-            raw = m.group(3).strip('_-')
+            raw = m.group(3).strip("_-")
             raw = _strip_trailing_size(raw)
             # 再映射回标准 base
             for base, synonyms in _DATASET_SYNONYMS.items():
@@ -184,14 +184,14 @@ def _find_dataset_base(fp: Path) -> str:
 
     # 兜底：从文件干名推断
     stem = _normalize_for_match(fp.stem)
-    stem = re.sub(r'_(metrics|llm_em_summary)$', '', stem)
+    stem = re.sub(r"_(metrics|llm_em_summary)$", "", stem)
     stem = _strip_trailing_size(stem)
     # 同义词再试一次
     for base, synonyms in _DATASET_SYNONYMS.items():
         if any(s in stem for s in synonyms):
             return base
     # 否则取第一段
-    parts = [p for p in re.split(r'[_\-]+', stem) if p]
+    parts = [p for p in re.split(r"[_\-]+", stem) if p]
     return parts[0] if parts else "unknown"
 
 
@@ -225,14 +225,101 @@ def infer_setting_from_parts(root_path: Path, parts: tuple[str, ...]) -> str:
 
 
 # =========================
+#  setting 解析与排序辅助
+# =========================
+
+_SETTING_NUM_PATTERN = re.compile(r"^-?\d+$")
+
+
+def _parse_setting_for_sort(setting: str) -> tuple[str, int | None, int]:
+    """
+    把 setting 拆成 (setting_group, setting_num, is_emft) 三要素：
+      - setting_group：大的分组（去掉收尾的 '_emft'，并把连字符按 '_' 处理；在遇到首个“纯数字”token前的所有 token 作为分组，
+        例如 'eata_precompute_16_emft' -> 'eata_precompute'；'eata_sdiv_4' -> 'eata_sdiv'；'sft_0' -> 'sft'）。
+      - setting_num：提取到的整数；如果没有数字则为 None；支持负数（如 precompute_-1）。
+      - is_emft：结尾是否有 '_emft'，用 0/1 表示，排序时非 emft 在前。
+    """
+    s = setting.lower()
+    is_emft = 1 if s.endswith("_emft") else 0
+    if is_emft:
+        s = s[:-5]  # 去掉尾部 "_emft"
+    s_norm = s.replace("-", "_")
+    tokens = [t for t in s_norm.split("_") if t]
+
+    group_tokens: list[str] = []
+    num_val: int | None = None
+
+    for t in tokens:
+        if _SETTING_NUM_PATTERN.match(t):
+            num_val = int(t)
+            break
+        group_tokens.append(t)
+
+    setting_group = "_".join(group_tokens) if group_tokens else s_norm
+    return setting_group, num_val, is_emft
+
+
+def _attach_sort_columns(df_like: pd.DataFrame) -> pd.DataFrame:
+    """
+    在包含 'benchmark', 'dataset', 'setting' 三列的 DataFrame 上追加排序辅助列：
+      - setting_group
+      - setting_num_fill：数字，None -> np.inf（让无数字的项排在该组最后）
+      - is_emft：0/1
+      - group_order：按 setting_group 的字母序映射到序号，保证稳定排序
+    """
+    df = df_like.copy()
+    parsed = df["setting"].map(_parse_setting_for_sort)
+    df["setting_group"] = parsed.map(lambda x: x[0])
+    df["setting_num"] = parsed.map(lambda x: x[1])
+    df["is_emft"] = parsed.map(lambda x: x[2])
+
+    # 无数字放在组内最后，这样例如 'base' 不会插入到有数字的组里；如果你希望无数字在组内最前，把 np.inf 改成 -np.inf
+    df["setting_num_fill"] = df["setting_num"].map(lambda x: x if x is not None else np.inf)
+
+    # 组名全局稳定排序
+    groups_sorted = sorted(df["setting_group"].unique())
+    group_to_order = {g: i for i, g in enumerate(groups_sorted)}
+    df["group_order"] = df["setting_group"].map(group_to_order)
+    return df
+
+
+def _sort_records(df_like: pd.DataFrame) -> pd.DataFrame:
+    """
+    对包含 'benchmark', 'dataset', 'setting' 的行按：
+    (benchmark, dataset, group_order, setting_num_fill, is_emft, setting) 排序。
+    返回去掉辅助列后的 DataFrame。
+    """
+    need_reset = False
+    df = df_like
+    # 允许传入已设置索引的 DataFrame
+    if isinstance(df.index, pd.MultiIndex) and set(df.index.names) >= {"benchmark", "dataset", "setting"}:
+        df = df.reset_index()
+        need_reset = True
+
+    df = _attach_sort_columns(df)
+    df = df.sort_values(
+        by=["benchmark", "dataset", "group_order", "setting_num_fill", "is_emft", "setting"],
+        ascending=[True, True, True, True, True, True],
+        kind="mergesort",  # 稳定排序，保证同键下原有顺序不被打乱
+    )
+    # 清理辅助列
+    df = df.drop(columns=["setting_group", "setting_num", "setting_num_fill", "is_emft", "group_order"])
+    if need_reset:
+        df = df.set_index(["benchmark", "dataset", "setting"])
+    return df
+
+
+# =========================
 #  主逻辑
 # =========================
+
 
 def analyze_metrics(root_dir: str) -> pd.DataFrame | None:
     """
     扫描指定根目录，解析所有指标文件（JSON/JSONL/CSV），并将结果整合到一个DataFrame中。
     - benchmark 与 dataset 来自“写死”的匹配规则（不拼接数量）。
     - setting 采用“智能两级”：第二段是目录时用两级，否则只用第一级。
+    - 结果按（大的 setting 分组 + 组内数字升序）排序。
     """
     root_path = Path(root_dir)
     if not root_path.is_dir():
@@ -276,15 +363,20 @@ def analyze_metrics(root_dir: str) -> pd.DataFrame | None:
         print("未找到任何可用 metrics 文件。")
         return None
 
-    # -------- 构建 DataFrame --------
+    # -------- 构建 DataFrame，并应用自定义排序 --------
     records = list(records_dict.values())
-    df = pd.DataFrame(records).set_index(["benchmark", "dataset", "setting"]).sort_index()
+    df = pd.DataFrame(records)
 
-    # 尝试将所有列转成数值，无法转换的保留为 NaN（便于聚合/比较）
-    for col in df.columns:
+    # 尝试将所有指标列转为数值
+    metric_cols = [c for c in df.columns if c not in {"benchmark", "dataset", "setting"}]
+    for col in metric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # 保存汇总结果
+    # 自定义排序（大的 setting 分组 + 组内数字升序）
+    df = _sort_records(df)
+
+    # 设定索引并保存
+    df = df.set_index(["benchmark", "dataset", "setting"])
     df.to_csv("result.csv")
     return df
 
@@ -299,6 +391,7 @@ def display_filtered_results(
     根据指定的筛选条件，在控制台打印格式化的DataFrame。
     - 筛选结果会自动包含 'base' 方法便于对比（若存在）。
     - setting 支持正则匹配；benchmark/dataset 支持列表过滤。
+    - 展示顺序遵循（大的 setting 分组 + 组内数字升序）的排序规则。
     """
     if df is None or df.empty:
         print("输入的DataFrame为空，无法进行筛选和显示。")
@@ -306,15 +399,21 @@ def display_filtered_results(
 
     if not any([setting_pattern, benchmark_filter, dataset_filter]):
         print("\n--- 完整指标汇总 (无筛选) ---")
+        # 直接按已有顺序打印（analyze_metrics 已经排好序）
         with pd.option_context(
-            "display.float_format", "{:.4f}".format,
-            "display.max_rows", None,
-            "display.max_columns", None,
-            "display.width", 200,
+            "display.float_format",
+            "{:.4f}".format,
+            "display.max_rows",
+            None,
+            "display.max_columns",
+            None,
+            "display.width",
+            200,
         ):
             print(df)
         return
 
+    # 转为行模式便于筛选
     temp_df = df.reset_index()
     filtered_df = temp_df.copy()
 
@@ -337,9 +436,9 @@ def display_filtered_results(
         print("\n根据您的筛选条件，没有找到任何匹配的数据。")
         return
 
+    # 自动包含同 (benchmark, dataset) 下的 base 作为对比
     related_benchmarks = filtered_df["benchmark"].unique()
     related_datasets = filtered_df["dataset"].unique()
-
     base_to_display = temp_df[
         (temp_df["setting"] == "base")
         & (temp_df["benchmark"].isin(related_benchmarks))
@@ -347,14 +446,22 @@ def display_filtered_results(
     ]
 
     final_df_rows = pd.concat([base_to_display, filtered_df]).drop_duplicates()
-    display_df = final_df_rows.set_index(["benchmark", "dataset", "setting"]).sort_index()
 
+    # 关键：应用相同的自定义排序规则
+    final_df_rows = _sort_records(final_df_rows)
+
+    # 恢复索引并打印
+    display_df = final_df_rows.set_index(["benchmark", "dataset", "setting"])
     print("\n--- 筛选结果 (包含 'base' 对比) ---")
     with pd.option_context(
-        "display.float_format", "{:.4f}".format,
-        "display.max_rows", None,
-        "display.max_columns", None,
-        "display.width", 200,
+        "display.float_format",
+        "{:.4f}".format,
+        "display.max_rows",
+        None,
+        "display.max_columns",
+        None,
+        "display.width",
+        200,
     ):
         print(display_df)
 
@@ -363,25 +470,36 @@ def display_filtered_results(
 #  CLI
 # =========================
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="分析模型性能指标并根据条件筛选结果。",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
-        "-r", "--root-dir", type=str,
+        "-r",
+        "--root-dir",
+        type=str,
         help="指定要分析的根目录。\n如果未提供，将默认使用脚本所在目录的父目录下的 'results' 文件夹。",
     )
     parser.add_argument(
-        "-s", "--setting-pattern", type=str,
+        "-s",
+        "--setting-pattern",
+        type=str,
         help="用于筛选 'setting' 的正则表达式。\n示例: 'ttl.*' 会匹配以 ttl 开头的设置。",
     )
     parser.add_argument(
-        "-b", "--benchmark-filter", nargs="+", type=str,
+        "-b",
+        "--benchmark-filter",
+        nargs="+",
+        type=str,
         help="要显示的 benchmark 列表（如：-b db ib rb）。",
     )
     parser.add_argument(
-        "-d", "--dataset-filter", nargs="+", type=str,
+        "-d",
+        "--dataset-filter",
+        nargs="+",
+        type=str,
         help="要显示的 dataset 列表（如：-d gsm8k alpaca_gpt4）。",
     )
 
