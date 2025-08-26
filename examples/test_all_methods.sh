@@ -47,6 +47,11 @@ DO_EVAL="true"
 MAX_TRAIN_JOBS_PER_GPU=2
 MAX_EVAL_JOBS_PER_GPU=10
 
+# === 覆盖开关（是否无视已有产物并重跑）===
+OVERWRITE_TRAIN="false"
+OVERWRITE_INFER="false"
+OVERWRITE_EVAL="false"
+
 # 任务启动节流
 ENABLE_LAUNCH_DELAY="true"
 LAUNCH_DELAY_SECONDS=1
@@ -121,7 +126,7 @@ LORA_TARGET_MODE_LIST=(
   # "attn" 
   "ffn" 
   "attn_ffn"
-  )
+)
 # 说明：映射到具体 target 名（适配 Qwen2.5 命名）
 resolve_lora_target() {
   case "$1" in
@@ -131,7 +136,7 @@ resolve_lora_target() {
     *) echo "$1" ;; # 允许直接传自定义 target 字符串
   esac
 }
-# LoRA 标签后缀（用于 run_name / 日志 / 目录等）
+# LoRA 标签后缀（用于命名）
 lora_suffix_for() {
   local method="$1"
   if [[ "$method" == "base" ]]; then
@@ -143,9 +148,9 @@ lora_suffix_for() {
 
 # ===== 将关键开关改为“列表 + 迭代”，方便做 ablation =====
 USE_FULL_ENTROPY_IN_GENERATION_LIST=("false")
-# ✅ 注意：bash 数组不要用逗号分隔；逗号会进入元素本身
-EATA_SELECT_HIGH_ENTROPY_LIST=("true", "false")  # 仅对 eata/eata_sdiv 生效
-USE_EMFT_LOSS_LIST=("true", "false")
+# 注意：bash 数组不要用逗号分隔
+EATA_SELECT_HIGH_ENTROPY_LIST=("true" "false")  # 仅对 eata/eata_sdiv 生效
+USE_EMFT_LOSS_LIST=("true" "false")
 # 生成模型模式（适用于名字包含 "tent"/"eata" 的方法）："simultaneous" 或 "precompute"
 GEN_MODEL_LIST=("precompute")
 
@@ -220,7 +225,7 @@ sanitize_tag() { sed 's/\./p/g' <<< "$1"; }
 # 方法分类
 method_is_ttlu_like() { local m="$1"; [[ "$m" == "ttlu" || "$m" == nll* || "$m" == ppl* ]]; }
 method_is_ttl_only() { [[ "$1" == "ttl" ]]; }
-method_is_non_ttl()  { ! method_is_ttlu_like "$1" && ! method_is_ttl_only "$1"; }
+method_is_non_ttl()  { ! method_is_ttlu_like "$1" && ! method_is_ttl_only "$1"; }  # 目前未用，保留
 
 # 哪些方法有“生成长度”维度（不含 ttl/ttlu/sft）
 method_has_gen_dim() {
@@ -247,7 +252,7 @@ get_stage_for_method() {
   fi
 }
 
-# 后缀（仅对有生成维度的方法添加与生成相关的后缀，并附加 LoRA 目标）
+# 后缀（仅对有生成维度的方法添加与生成相关的后缀；不在此处拼 LoRA）
 get_suffix() {
   local method="$1"
   local gen_len="$2"
@@ -280,11 +285,6 @@ get_suffix() {
     if [[ "${USE_KL_REGULARIZATION}" == "true" ]]; then suffix+="_kl${KL_WEIGHT}"; else suffix+="_nokl"; fi
   fi
 
-  # LoRA 目标后缀（base 方法不附加）
-  if [[ "${method}" != "base" ]]; then
-    suffix+="$(lora_suffix_for "${method}")"
-  fi
-
   echo "${suffix}"
 }
 
@@ -306,6 +306,9 @@ get_exp_tag_for_method() {
 method_dir_name() {
   local method="$1" gen_len="$2"
   local suffix; suffix="$(get_suffix "$method" "$gen_len")"
+  local lora_sfx=""
+  [[ "${method}" != "base" ]] && lora_sfx="$(lora_suffix_for "${method}")"
+
   # 对 ttl/ttlu：不再有中间“方法层”目录
   if method_is_ttl_only "${method}" || method_is_ttlu_like "${method}"; then
     echo ""  # 无方法层
@@ -314,12 +317,12 @@ method_dir_name() {
   if method_has_gen_dim "${method}"; then
     # 对名字包含 "tent" 或 "eata" 的方法，目录名改为 {method}_{gen_model}_{gen_len}
     if [[ "${method}" == *tent* || "${method}" == *eata* ]]; then
-      echo "${method}_${GEN_MODEL}_${gen_len}${suffix}"
+      echo "${method}_${GEN_MODEL}_${gen_len}${suffix}${lora_sfx}"
     else
-      echo "${method}_${gen_len}${suffix}"
+      echo "${method}_${gen_len}${suffix}${lora_sfx}"
     fi
   else
-    echo "${method}${suffix}"
+    echo "${method}${suffix}${lora_sfx}"
   fi
 }
 dataset_key() {
@@ -386,11 +389,14 @@ run_train() {
   fi
 
   local out_dir; out_dir="$(adapter_dir "${method}" "${gen_len}" "${dataset}")"
-  local lora_sfx; lora_sfx="$(lora_suffix_for "${method}")"
-  local run_name="${dataset}_$(method_dir_name "${method}" "${gen_len}")${lora_sfx}"
+  local run_name="${dataset}_$(method_dir_name "${method}" "${gen_len}")"
   mkdir -p "${out_dir}"
 
   local suffix; suffix="$(get_suffix "$method" "$gen_len")"
+  # 日志后缀也包含 LoRA，便于区分
+  if [[ "${method}" != "base" ]]; then
+    suffix+="$(lora_suffix_for "${method}")"
+  fi
   local log_dir="${LOG_ROOT}/${MODEL_SHORT}/${method}/train${suffix}"
   mkdir -p "${log_dir}"
   local log_file="${log_dir}/$(dataset_key "${method}" "${gen_len}" "${dataset}").log"
@@ -410,6 +416,11 @@ run_train() {
   # 指定 LoRA 目标（覆盖 YAML 中的 lora_target）
   local lora_target_str; lora_target_str="$(resolve_lora_target "${LORA_TARGET_MODE}")"
   train_args+=("lora_target=${lora_target_str}")
+
+  # 覆盖开关：训练时允许覆盖输出目录
+  if [[ "${OVERWRITE_TRAIN}" == "true" ]]; then
+    train_args+=("overwrite_output_dir=true")
+  fi
 
   # 仅 ttl/ttlu 注入 TTL 参数；ttlu 额外注入 ref_* 配置；非 TTL 方法不出现任何 ttl_* 参数
   if [[ "${stage_to_run}" == "ttl" || "${stage_to_run}" == "ttlu" ]]; then
@@ -492,6 +503,9 @@ run_infer() {
   fi
 
   local suffix; suffix="$(get_suffix "$method" "$gen_len")"
+  if [[ "${method}" != "base" ]]; then
+    suffix+="$(lora_suffix_for "${method}")"
+  fi
   local log_dir="${LOG_ROOT}/${MODEL_SHORT}/${method}/infer${suffix}"
   mkdir -p "${log_dir}"
   local log_file="${log_dir}/$(dataset_key "${method}" "${gen_len}" "${dataset}").log"
@@ -541,6 +555,9 @@ run_eval() {
   fi
 
   local suffix; suffix="$(get_suffix "$method" "$gen_len")"
+  if [[ "${method}" != "base" ]]; then
+    suffix+="$(lora_suffix_for "${method}")"
+  fi
   local log_dir="${LOG_ROOT}/${MODEL_SHORT}/${method}/eval${suffix}"
   mkdir -p "${log_dir}"
   local log_file="${log_dir}/$(dataset_key "${method}" "${gen_len}" "${dataset}").log"
@@ -608,36 +625,48 @@ execute_stage_globally() {
           echo "⏩ [TRAIN] base 方法仅推理，跳过: ${method}/${dataset}"
           should_run=false
         else
-          local adir; adir="$(adapter_dir "${method}" "${len}" "${dataset}")"
-          if [[ -d "${adir}" ]]; then
-            if compgen -G "${adir}"/*.safetensors > /dev/null 2>&1; then
-              echo "✅ [TRAIN] 检测到 .safetensors，跳过: ${adir}"
-              should_run=false
+          if [[ "${OVERWRITE_TRAIN}" == "true" ]]; then
+            should_run=true
+          else
+            local adir; adir="$(adapter_dir "${method}" "${len}" "${dataset}")"
+            if [[ -d "${adir}" ]]; then
+              if compgen -G "${adir}"/*.safetensors > /dev/null 2>&1; then
+                echo "✅ [TRAIN] 检测到 .safetensors，跳过: ${adir}"
+                should_run=false
+              else
+                echo "⚠️ [TRAIN] 目录存在但缺少 .safetensors，将重训: ${adir}"
+                should_run=true
+              fi
             else
-              echo "⚠️ [TRAIN] 目录存在但缺少 .safetensors，将重训: ${adir}"
               should_run=true
             fi
-          else
-            should_run=true
           fi
         fi
         ;;
       "infer")
-        local rdir; rdir="$(results_dir "${method}" "${len}")"
-        local ifile="${rdir}/$(dataset_key "${method}" "${len}" "${dataset}").jsonl"
-        if [[ ! -f "${ifile}" ]]; then
+        if [[ "${OVERWRITE_INFER}" == "true" ]]; then
           should_run=true
         else
-          echo "✅ [INFER] 结果已存在，跳过: ${ifile}"
+          local rdir; rdir="$(results_dir "${method}" "${len}")"
+          local ifile="${rdir}/$(dataset_key "${method}" "${len}" "${dataset}").jsonl"
+          if [[ ! -f "${ifile}" ]]; then
+            should_run=true
+          else
+            echo "✅ [INFER] 结果已存在，跳过: ${ifile}"
+          fi
         fi
         ;;
       "eval")
-        local rdir; rdir="$(results_dir "${method}" "${len}")"
-        local efile="${rdir}/$(dataset_key "${method}" "${len}" "${dataset}")_metrics.json"
-        if [[ ! -f "${efile}" ]]; then
+        if [[ "${OVERWRITE_EVAL}" == "true" ]]; then
           should_run=true
         else
-          echo "✅ [EVAL] 指标已存在，跳过: ${efile}"
+          local rdir; rdir="$(results_dir "${method}" "${len}")"
+          local efile="${rdir}/$(dataset_key "${method}" "${len}" "${dataset}")_metrics.json"
+          if [[ ! -f "${efile}" ]]; then
+            should_run=true
+          else
+            echo "✅ [EVAL] 指标已存在，跳过: ${efile}"
+          fi
         fi
         ;;
       *)
@@ -773,7 +802,7 @@ for MODEL_KEY in "${models[@]}"; do
   DEFAULT_TTL_SCALER="${TTL_SCALER_LIST[0]}"
   DEFAULT_TTL_STREAMING_BATCH_SIZE="${TTL_STREAMING_BATCH_SIZE_LIST[0]}"
 
-  # 新增变量默认（用于避免在无关方法上产生重复组合）
+  # 新增变量默认（用于避免在无关方法上重复组合）
   DEFAULT_USE_FULL_ENTROPY_IN_GENERATION="${USE_FULL_ENTROPY_IN_GENERATION_LIST[0]}"
   DEFAULT_EATA_SELECT_HIGH_ENTROPY="${EATA_SELECT_HIGH_ENTROPY_LIST[0]}"
   DEFAULT_USE_EMFT_LOSS="${USE_EMFT_LOSS_LIST[0]}"
@@ -869,14 +898,9 @@ for MODEL_KEY in "${models[@]}"; do
                                       if ! method_has_gen_dim "${method}" && [[ "${USE_FULL_ENTROPY_IN_GENERATION}" != "${DEFAULT_USE_FULL_ENTROPY_IN_GENERATION}" ]]; then
                                         continue
                                       fi
-                                      # ✅ 仅 eata/eata_sdiv 允许切换 EATA_SELECT_HIGH_ENTROPY
+                                      # 仅 eata/eata_sdiv 允许切换 EATA_SELECT_HIGH_ENTROPY
                                       if [[ "${method}" != "eata" && "${method}" != "eata_sdiv" ]] && [[ "${EATA_SELECT_HIGH_ENTROPY}" != "${DEFAULT_EATA_SELECT_HIGH_ENTROPY}" ]]; then
                                         continue
-                                      fi
-                                      # 只有 tent/emft 家族才真正传入 use_emft_loss
-                                      if [[ ( "${method}" == *tent* || "${method}" == *emft* ) && \
-                                            "${USE_EMFT_LOSS}" == "true" ]]; then
-                                        train_args+=("use_emft_loss=true")
                                       fi
                                       # 仅 tent/eata 家族允许切换 GEN_MODEL
                                       if [[ "${method}" != *tent* && "${method}" != *eata* ]] && [[ "${GEN_MODEL}" != "${DEFAULT_GEN_MODEL}" ]]; then
