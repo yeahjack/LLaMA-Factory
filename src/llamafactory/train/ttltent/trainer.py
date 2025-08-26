@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, List
 
 import torch
 from torch.nn import CrossEntropyLoss
@@ -32,155 +31,22 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-# Loss Balancing Classes
-class DynamicWeightBalancer:
-    def __init__(self, alpha=0.12, initial_weights=[1.0, 1.0, 1.0]):
-        self.alpha = alpha
-        self.weights = torch.tensor(initial_weights, dtype=torch.float32)
-        self.loss_history = []
+class TTLTENTTrainer(Seq2SeqTrainer):
+    """Seq2Seq Trainer for the combined TTL + TENT adaptation.
 
-    def update_weights(self, losses):
-        """根据loss的相对大小动态调整权重"""
-        losses = torch.tensor(losses)
-        if len(self.loss_history) > 0:
-            prev_losses = torch.tensor(self.loss_history[-1])
-            loss_ratios = losses / (prev_losses + 1e-8)
-            self.weights = self.weights * (2.0 - loss_ratios * self.alpha)
-            self.weights = torch.clamp(self.weights, 0.1, 10.0)
+    TTL 部分（与 TTLU 对齐的结构，训练损失改为句子级 CE）：
+      - 以输入 token 本身作为目标，训练损失为句子级 CE（忽略 padding 与句首）。
+      - 参考分布（用于筛选与加权）支持：
+          ttl_ref_mode="precompute": 训练前由 workflow 用 base model 预计算每样本 CE；
+          ttl_ref_mode="simultaneous": 训练时用当前模型即时计算 CE。
+      - gating 与权重：
+          mask = 1{ CE_ref > ttl_threshold }
+          coeff = ttl_sample_efficiency_scaler * exp(CE_ref - ttl_threshold)
+          在被选样本上平均；若一个都没选到，退化为简单平均。
 
-        self.loss_history.append(losses.tolist())
-        return self.weights
-
-
-class GradientMagnitudeBalancer:
-    def __init__(self, target_ratio=1.0, momentum=0.9):
-        self.target_ratio = target_ratio
-        self.momentum = momentum
-        self.ema_grad_norms = None
-
-    def compute_balanced_weights(self, model, losses):
-        """基于梯度大小计算平衡权重"""
-        grad_norms = []
-
-        # 获取可训练参数
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-
-        for loss in losses:
-            if loss.requires_grad and loss.item() > 0:
-                try:
-                    grads = torch.autograd.grad(
-                        loss, trainable_params, retain_graph=True, create_graph=False, allow_unused=True
-                    )
-                    # 过滤None梯度
-                    valid_grads = [g for g in grads if g is not None]
-                    if valid_grads:
-                        grad_norm = torch.sqrt(sum(torch.sum(g**2) for g in valid_grads))
-                        grad_norms.append(grad_norm)
-                    else:
-                        grad_norms.append(torch.tensor(1.0, device=loss.device))
-                except RuntimeError:
-                    # 如果梯度计算失败，使用默认值
-                    grad_norms.append(torch.tensor(1.0, device=loss.device))
-            else:
-                grad_norms.append(torch.tensor(1.0, device=loss.device))
-
-        grad_norms = torch.stack(grad_norms)
-
-        if self.ema_grad_norms is None:
-            self.ema_grad_norms = grad_norms
-        else:
-            self.ema_grad_norms = self.momentum * self.ema_grad_norms + (1 - self.momentum) * grad_norms
-
-        avg_norm = self.ema_grad_norms.mean()
-        weights = avg_norm / (self.ema_grad_norms + 1e-8)
-
-        return weights
-
-
-class UncertaintyWeightBalancer(torch.nn.Module):
-    def __init__(self, num_tasks=3):
-        super().__init__()
-        self.log_vars = torch.nn.Parameter(torch.zeros(num_tasks))
-
-    def forward(self, losses):
-        """基于学习的不确定性计算权重"""
-        losses = torch.stack(losses)
-        precision = torch.exp(-self.log_vars)
-        weighted_losses = precision * losses + self.log_vars
-        return weighted_losses.sum(), precision
-
-
-class MovingAverageBalancer:
-    def __init__(self, window_size=100, target_ratio=1.0):
-        self.window_size = window_size
-        self.target_ratio = target_ratio
-        self.loss_history = {"ttl": [], "tent": [], "kl": []}
-
-    def update_weights(self, losses, loss_names=["ttl", "tent", "kl"]):
-        """基于移动平均调整权重"""
-        for i, name in enumerate(loss_names):
-            if i < len(losses):
-                self.loss_history[name].append(losses[i].item())
-                if len(self.loss_history[name]) > self.window_size:
-                    self.loss_history[name] = self.loss_history[name][-self.window_size :]
-
-        if len(self.loss_history["ttl"]) < 10:
-            return torch.tensor([1.0, 1.0, 1.0])
-
-        # 计算移动平均
-        avg_losses = []
-        for name in loss_names:
-            if self.loss_history[name]:
-                avg_loss = sum(self.loss_history[name]) / len(self.loss_history[name])
-                avg_losses.append(avg_loss)
-            else:
-                avg_losses.append(1.0)
-
-        # 归一化权重
-        max_avg = max(avg_losses)
-        weights = [max_avg / (avg + 1e-8) for avg in avg_losses]
-
-        return torch.tensor(weights)
-
-
-class AdaptiveLossScaler:
-    def __init__(self, initial_scale=1.0, scale_factor=1.1, patience=10):
-        self.scales = torch.tensor([initial_scale, initial_scale, initial_scale])
-        self.scale_factor = scale_factor
-        self.patience = patience
-        self.loss_history = []
-        self.no_improve_counts = [0, 0, 0]
-
-    def update_scales(self, losses):
-        """自适应调整loss缩放因子"""
-        current_losses = torch.tensor([loss.item() for loss in losses])
-
-        if len(self.loss_history) > 5:
-            recent_avg = torch.tensor([sum(h[i] for h in self.loss_history[-5:]) / 5 for i in range(len(losses))])
-
-            for i, (curr, avg) in enumerate(zip(current_losses, recent_avg)):
-                if curr > avg * 1.05:
-                    self.no_improve_counts[i] += 1
-                    if self.no_improve_counts[i] >= self.patience:
-                        self.scales[i] *= self.scale_factor
-                        self.no_improve_counts[i] = 0
-                else:
-                    self.no_improve_counts[i] = 0
-
-        self.loss_history.append(current_losses.tolist())
-        return self.scales
-
-
-class CombinedTTLTentTrainer(Seq2SeqTrainer):
-    """Combined TTL-TENT Trainer for Test-Time Learning.
-
-    This trainer combines:
-    - TTL (Test-Time Learning): Optimizes perplexity/NLL on input sequences
-    - TENT (Test-Time Entropy Minimization): Minimizes entropy on generated sequences
-
-    The combined approach leverages both methods' strengths:
-    - TTL helps the model adapt to the input distribution
-    - TENT reduces uncertainty in generation
+    TENT 部分（熵最小化）：
+      - gen_model="simultaneous": 现场 generate；
+      - gen_model="precompute": 使用 workflow 载入的 jsonl 预测，按 batch 顺序消费。
     """
 
     def __init__(
@@ -189,56 +55,31 @@ class CombinedTTLTentTrainer(Seq2SeqTrainer):
         *args,
         **kwargs,
     ):
+        # 供 TENT 使用的预计算续写序列与模式
+        self.precomputed_predictions: Optional[List[List[int]]] = kwargs.pop("precomputed_predictions", None)
+        self.gen_model_mode: str = kwargs.pop("gen_model_mode", getattr(finetuning_args, "gen_model", "simultaneous"))
+
         super().__init__(*args, **kwargs)
         self.finetuning_args = finetuning_args
 
-        # Combined token log: stores both perplexity and entropy information
+        # TTL: 预计算的参考 sentence CE（仅在 ttl_ref_mode=precompute 时使用）
+        self.ref_sentence_ce: Optional[dict[int, float]] = None
+
+        # TENT: 预计算序列的消费指针
+        self._precompute_ptr: int = 0
+
+        # 训练阶段的可选 token 级日志
         self.token_log = []
 
-        # Initialize a counter for cumulative selected samples for logging.
-        self.cumulative_selected_samples = 0
+        # decoder-only 常见：左填充以适配 FlashAttention
+        if hasattr(self, "processing_class") and self.processing_class is not None:
+            try:
+                self.processing_class.padding_side = "left"
+                logger.info_rank0("Set tokenizer padding_side='left' for FlashAttention compatibility.")
+            except Exception as e:
+                logger.warning_rank0(f"Could not set padding_side: {e}")
 
-        # Initialize loss balancer
-        self._initialize_loss_balancer()
-
-        # Store original model for KL regularization
-        if getattr(self.finetuning_args, "use_kl_regularization", False):
-            self.original_model_state = None
-
-        self.processing_class.padding_side = "left"
-
-    def _initialize_loss_balancer(self):
-        """初始化loss平衡器"""
-        method = getattr(self.finetuning_args, "loss_balancing_method", "static")
-
-        if method == "dynamic_weight":
-            self.loss_balancer = DynamicWeightBalancer()
-        elif method == "gradient_magnitude":
-            self.loss_balancer = GradientMagnitudeBalancer()
-        elif method == "uncertainty":
-            self.loss_balancer = UncertaintyWeightBalancer()
-            # 将balancer注册为模块的一部分
-            if hasattr(self, "model") and self.model is not None:
-                self.model.loss_balancer = self.loss_balancer
-        elif method == "moving_average":
-            self.loss_balancer = MovingAverageBalancer()
-        elif method == "adaptive_scaling":
-            self.loss_balancer = AdaptiveLossScaler()
-        else:
-            self.loss_balancer = None
-
-    def _should_use_alternating_mode(self):
-        """判断是否使用交替训练模式"""
-        return getattr(self.finetuning_args, "alternating_training", False)
-
-    def _get_current_training_mode(self):
-        """获取当前训练模式 (奇数步: TTL, 偶数步: TENT)"""
-        if not self._should_use_alternating_mode():
-            return "combined"
-
-        # 奇数步优化perplexity (TTL), 偶数步优化entropy (TENT)
-        return "ttl" if (self.state.global_step % 2 == 1) else "tent"
-
+    # ------------------------ 优化器 / 调度器 ------------------------ #
     @override
     def create_optimizer(self):
         if self.optimizer is None:
@@ -252,300 +93,208 @@ class CombinedTTLTentTrainer(Seq2SeqTrainer):
 
     @override
     def _get_train_sampler(self, *args, **kwargs):
-        if self.finetuning_args.disable_shuffling:
+        if getattr(self.finetuning_args, "disable_shuffling", False):
             import torch as _torch
 
             return _torch.utils.data.SequentialSampler(self.train_dataset)
         return super()._get_train_sampler(*args, **kwargs)
 
-    # 实用性能优化 - 只需要修改这几个关键方法
-
-    def _compute_kl_loss(self, model):
-        """计算KL散度正则化损失 - 优化版"""
-        # 🚀 优化1: 提前返回，避免不必要计算
-        if not getattr(self.finetuning_args, "use_kl_regularization", False):
-            return torch.tensor(0.0, device=model.device, requires_grad=False)
-
-        # 🚀 优化2: 延迟初始化
-        if self.original_model_state is None:
-            self.original_model_state = {}
-            for name, param in model.named_parameters():
-                if param.requires_grad:
-                    self.original_model_state[name] = param.data.clone().detach()
-
-        kl_loss = torch.tensor(0.0, device=model.device, requires_grad=True)
-        for name, param in model.named_parameters():
-            if param.requires_grad and name in self.original_model_state:
-                diff = param - self.original_model_state[name]
-                kl_loss = kl_loss + torch.sum(diff * diff)  # 更高效的平方计算
-
-        return kl_loss
-
+    # ------------------------ 核心：TTL + TENT ----------------------- #
     @override
-    def compute_loss(self, model, inputs, return_outputs: bool = False, num_items_in_batch=None):
-        # Get configuration parameters
-        generation_len = getattr(self.finetuning_args, "generation_len", 0)
-        ttl_weight = getattr(self.finetuning_args, "loss_weight_ttl", 1.0)
-        tent_weight = getattr(self.finetuning_args, "loss_weight_tent", 1.0)
-        kl_weight = getattr(self.finetuning_args, "kl_weight", 0.1)
-        use_kl = getattr(self.finetuning_args, "use_kl_regularization", False)
+    def compute_loss(
+        self,
+        model,
+        inputs: dict,
+        return_outputs: bool = False,
+        num_items_in_batch=None,
+    ):
+        # 不使用上游监督标签
+        if "labels" in inputs:
+            inputs = {k: v for k, v in inputs.items() if k != "labels"}
 
-        if "input_ids" in inputs:
-            input_ids = inputs["input_ids"]
-        else:
-            raise RuntimeError("CombinedTrainer.compute_loss: No input_ids found in inputs.")
+        # === 公共输入 ===
+        input_ids: torch.Tensor = inputs["input_ids"]
+        attn = inputs.get("attention_mask", None)
+        device = input_ids.device
+        pad_id, eos_id = self._get_pad_eos_ids()
 
-        # 获取当前训练模式
-        training_mode = self._get_current_training_mode()
+        ttl_weight = float(getattr(self.finetuning_args, "loss_weight_ttl", 1.0))
+        tent_weight = float(getattr(self.finetuning_args, "loss_weight_tent", 1.0))
+        generation_len = int(getattr(self.finetuning_args, "generation_len", 0))
 
-        # 🚀 优化3: 根据模式决定需要计算的loss
-        need_ttl = training_mode in ["combined", "ttl"]
-        need_tent = training_mode in ["combined", "tent"] and generation_len > 0
-
-        # Initialize losses
-        ttl_loss = torch.tensor(0.0, device=model.device, requires_grad=need_ttl)
-        tent_loss = torch.tensor(0.0, device=model.device, requires_grad=need_tent)
-        kl_loss = torch.tensor(0.0, device=model.device, requires_grad=use_kl)
-
-        # 用于日志的变量
-        per_sample_nll = torch.tensor([0.0], device=model.device)
-        per_sample_ppl = torch.tensor([1.0], device=model.device)
-        per_token_nll_input = torch.tensor([0.0], device=model.device)
-        mask = torch.tensor([True], device=model.device).bool()
-        shift_labels = torch.tensor([0], device=model.device)
-        num_selected = 0
-        total_samples = 1
+        total_loss = torch.tensor(0.0, device=device, dtype=torch.float32, requires_grad=True)
         outputs = None
 
-        # Part 1: TTL Loss on Input Sequence
-        if need_ttl:
-            # Forward pass for input sequence
-            model_inputs = {k: v for k, v in inputs.items() if k != "labels"}
-            outputs = model(**model_inputs)
-            logits = outputs["logits"]  # [B, L, V]
+        # =============== TTL: 句子级 CE + gating（与 TTLU 对齐） =============== #
+        # 前向（输入序列）
+        outputs = model(input_ids=input_ids, attention_mask=attn)
+        logits: torch.Tensor = outputs["logits"]  # [B, L, V]
 
-            # Compute TTL loss (perplexity/NLL based)
-            shift_logits = logits[..., :-1, :].contiguous()  # [B, L-1, V]
-            shift_labels = input_ids[..., 1:].contiguous()  # [B, L-1]
+        # 屏蔽 pad 与句首
+        labels_eff = input_ids.clone()
+        if attn is not None:
+            labels_eff = labels_eff.masked_fill(attn == 0, IGNORE_INDEX)
+        labels_eff[:, 0] = IGNORE_INDEX
 
-            loss_fct = CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
-            per_token_loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-            ).view(shift_labels.size())  # [B, L-1]
+        # 训练用 CE（句子级）
+        sentence_ce_train = self._cal_ce(logits, labels_eff)  # [B]
 
-            per_token_nll_input = per_token_loss
+        # 参考 CE 来源
+        ref_mode = str(getattr(self.finetuning_args, "ttl_ref_mode", "precompute")).lower()
+        if ref_mode not in {"precompute", "simultaneous"}:
+            raise ValueError(f"Unsupported ttl_ref_mode: {ref_mode}")
 
-            mask = shift_labels != IGNORE_INDEX  # [B, L-1]
-            per_token_loss = per_token_loss * mask
-
-            token_counts = mask.sum(dim=1).clamp(min=1)  # [B]
-            per_sample_nll = per_token_loss.sum(dim=1) / token_counts
-
-            # Parse TTL loss configuration
-            ttl_loss_cfg = getattr(self.finetuning_args, "ttl_loss", "ppl_nll")
-            parts = ttl_loss_cfg.split("_")
-            metric_form = parts[0].lower()
-            selection_form = parts[1].lower() if len(parts) == 2 else None
-
-            # 🚀 优化4: 只在需要时才计算昂贵的exp操作
-            per_sample_ppl = None
-            if metric_form == "ppl" or selection_form == "ppl":
-                per_sample_ppl = torch.exp(per_sample_nll.clamp(max=20))
-
-            total_samples = per_sample_nll.size(0)
-
-            # Apply selection gating if configured
-            selection_score = None
-            if selection_form is not None:
-                scaler = getattr(self.finetuning_args, "ttl_sample_efficiency_scaler", 1.0)
-                base_threshold = getattr(self.finetuning_args, "ttl_threshold", 3.0)
-
-                if selection_form == "ppl":
-                    if per_sample_ppl is None:
-                        per_sample_ppl = torch.exp(per_sample_nll.clamp(max=20))
-                    ppl_threshold = math.exp(base_threshold)
-                    indicator = (per_sample_ppl > ppl_threshold).float()
-                    raw_score = (per_sample_ppl / ppl_threshold).clamp(max=1e6)
-                else:  # "nll"
-                    nll_threshold = base_threshold
-                    indicator = (per_sample_nll > nll_threshold).float()
-                    raw_score = (per_sample_nll / nll_threshold).clamp(max=1e6)
-
-                selection_score = (scaler * raw_score * indicator).detach()  # [B]
-                num_selected = int(indicator.sum().item())
-
-                # 🚀 优化5: 减少日志频率
-                if self.state.global_step % (self.args.logging_steps * 5) == 0:
-                    logger.info_rank0(f"[TTL] Selected {num_selected} / {total_samples} high-perplexity samples.")
-
-            # Compute TTL loss
-            if metric_form == "ppl":
-                if per_sample_ppl is None:
-                    per_sample_ppl = torch.exp(per_sample_nll.clamp(max=20))
-                per_sample_metric = per_sample_ppl
-            else:
-                per_sample_metric = per_sample_nll
-
-            if selection_score is None:
-                ttl_loss = per_sample_metric.mean()
-            else:
-                ttl_loss = (selection_score * per_sample_metric).mean()
-
-        # Part 2: TENT Loss on Generated Sequence
-        generated_tokens = None
-        entropy = None
-        entropy_mask = None
-
-        if need_tent:
-            # 🚀 优化6: 避免不必要的模式切换
-            was_training = model.training
-            if was_training:
-                self.model.eval()
-
+        if ref_mode == "simultaneous":
             with torch.no_grad():
-                generated_tokens = self.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=inputs.get("attention_mask"),
-                    max_new_tokens=generation_len,
-                    pad_token_id=self.processing_class.pad_token_id,
-                    eos_token_id=self.processing_class.eos_token_id,
-                    do_sample=False,
-                    top_k=None,
-                    top_p=None,
-                    temperature=1.0,
+                sentence_ce_ref = self._cal_ce(logits, labels_eff)  # [B]
+        else:
+            if "example_id" not in inputs:
+                raise RuntimeError(
+                    "ttl_ref_mode=precompute 需要 batch 中包含 example_id；"
+                    "请在 workflow 中为数据集添加该字段，并用包装 collator 传递。"
                 )
+            if self.ref_sentence_ce is None:
+                raise RuntimeError("参考 CE 尚未预计算，请先在 workflow 中完成预计算并设置 trainer.ref_sentence_ce。")
+            ex_ids = inputs["example_id"]
+            if isinstance(ex_ids, torch.Tensor):
+                ex_ids = ex_ids.tolist()
+            sentence_ce_ref = torch.tensor(
+                [self.ref_sentence_ce[int(e)] for e in ex_ids],
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+
+        # gating 与权重
+        threshold = float(getattr(self.finetuning_args, "ttl_threshold", 3.0))
+        scaler = float(getattr(self.finetuning_args, "ttl_sample_efficiency_scaler", 0.1))
+
+        mask = (sentence_ce_ref > threshold).to(logits.dtype)  # [B]
+        coeff = scaler * torch.exp(sentence_ce_ref.detach() - threshold)  # [B]
+
+        ttl_vec = sentence_ce_train * coeff * mask  # [B]
+        if mask.sum() == 0:
+            ttl_loss = ttl_vec.mean()
+        else:
+            ttl_loss = ttl_vec.sum() / mask.sum()
+
+        total_loss = total_loss + ttl_weight * ttl_loss
+
+        # ===================== TENT: 熵最小化 ====================== #
+        if generation_len != 0 and tent_weight > 0.0:
+            # 现场或预计算生成序列
+            with torch.no_grad():
+                if self.gen_model_mode == "precompute" and self.precomputed_predictions is not None:
+                    cont = self._fetch_precomputed_continuations(
+                        bsz=input_ids.size(0),
+                        limit=max(0, generation_len) if generation_len > 0 else None,
+                        pad_id=pad_id,
+                        device=device,
+                        dtype=input_ids.dtype,
+                    )
+                    generated_tokens = torch.cat([input_ids, cont], dim=1)
+                else:
+                    max_tokens = 2048 if generation_len == -1 else generation_len
+                    generated_tokens = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attn,
+                        max_new_tokens=max_tokens,
+                        pad_token_id=pad_id,
+                        eos_token_id=eos_id,
+                        do_sample=False,
+                        top_k=None,
+                        top_p=None,
+                        temperature=1.0,
+                    )
                 prompt_len = input_ids.size(1)
 
-            if was_training:
-                self.model.train()
+            # 前向（生成后的拼接序列）
+            outputs_gen: CausalLMOutput = self.model(input_ids=generated_tokens)
+            logits_gen = outputs_gen.logits  # [B, T, V]
 
-            # Forward pass on generated sequence with gradient
-            gen_outputs: CausalLMOutput = self.model(input_ids=generated_tokens)
-            gen_logits = gen_outputs.logits  # [B, T, V]
-
-            # Slice logits/tokens for generation part
+            # 切片生成段
             if getattr(self.finetuning_args, "use_full_entropy_in_generation", False):
-                entropy_logits = gen_logits[:, :-1, :]
-                entropy_tokens = generated_tokens[:, 1:]
+                gen_logits = logits_gen[:, :-1, :]
+                gen_tokens = generated_tokens[:, 1:]
             else:
-                entropy_logits = gen_logits[:, prompt_len - 1 : -1, :]
-                entropy_tokens = generated_tokens[:, prompt_len:]
+                gen_logits = logits_gen[:, prompt_len - 1 : -1, :]
+                gen_tokens = generated_tokens[:, prompt_len:]
 
-            # 🚀 优化7: 更高效的熵计算
-            log_probs = torch.nn.functional.log_softmax(entropy_logits, dim=-1)
+            # token-wise 熵
+            log_probs = torch.nn.functional.log_softmax(gen_logits, dim=-1)
             probs = torch.exp(log_probs)
             entropy = -torch.sum(probs * log_probs, dim=-1)  # [B, L]
 
-            # Mask padding
-            entropy_mask = (entropy_tokens != self.processing_class.pad_token_id).float()
-
-            # Compute TENT loss
+            # mask 并归约
+            entropy_mask = (gen_tokens != pad_id).float()
             if getattr(self.finetuning_args, "use_emft_loss", False):
-                loss_per_sequence = (entropy * entropy_mask).sum(dim=1)
-                tent_loss = loss_per_sequence.mean()
+                tent_loss = (entropy * entropy_mask).sum(dim=1).mean()
             else:
-                tent_loss = (entropy * entropy_mask).sum() / (entropy_mask.sum() + 1e-8)
+                tent_loss = (entropy * entropy_mask).sum() / (entropy_mask.sum().clamp_min(1e-8))
 
-        # Part 3: KL Regularization Loss - 使用优化版本
-        if use_kl:
-            kl_loss = self._compute_kl_loss(model)
-
-        # 🚀 优化8: 只在combined模式且需要时才使用loss balancer
-        balancer_freq = getattr(self.finetuning_args, "balancer_update_freq", 1)
-        if (
-            self.loss_balancer is not None
-            and training_mode == "combined"
-            and self.state.global_step % balancer_freq == 0
-        ):
-            method = getattr(self.finetuning_args, "loss_balancing_method", "static")
-
-            # 只包含需要梯度的loss
-            active_losses = [l for l in [ttl_loss, tent_loss, kl_loss] if l.requires_grad]
-
-            if len(active_losses) > 1 and method == "gradient_magnitude":
-                try:
-                    weights = self.loss_balancer.compute_balanced_weights(model, active_losses)
-                    idx = 0
-                    if ttl_loss.requires_grad:
-                        ttl_weight = weights[idx].item()
-                        idx += 1
-                    if tent_loss.requires_grad:
-                        tent_weight = weights[idx].item()
-                        idx += 1
-                    if kl_loss.requires_grad:
-                        kl_weight = weights[idx].item()
-                except Exception:
-                    # 如果梯度计算失败，使用默认权重
-                    pass
-
-        # 在交替训练模式下设置权重
-        if training_mode == "ttl":
-            tent_weight = 0.0
-        elif training_mode == "tent":
-            ttl_weight = 0.0
-
-        # 🚀 优化9: 智能的loss组合，避免零权重计算
-        total_loss = torch.tensor(0.0, device=model.device, requires_grad=True)
-        if ttl_weight > 0 and ttl_loss.requires_grad:
-            total_loss = total_loss + ttl_weight * ttl_loss
-        if tent_weight > 0 and tent_loss.requires_grad:
             total_loss = total_loss + tent_weight * tent_loss
-        if kl_weight > 0 and kl_loss.requires_grad:
-            total_loss = total_loss + kl_weight * kl_loss
+        else:
+            tent_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
 
-        # 🚀 优化10: 减少日志计算和字符串操作
-        if self.state.global_step % self.args.logging_steps == 0:
-            if self.is_in_train:
-                self.cumulative_selected_samples += num_selected
-
-            # 简化日志输出
-            logger.info_rank0(
-                f"[S{self.state.global_step}] TTL={ttl_loss.item():.3f} "
-                f"TENT={tent_loss.item():.3f} KL={kl_loss.item():.3f} "
-                f"Total={total_loss.item():.3f} ({training_mode})"
-            )
-
-            # 批量构建日志字典
-            log_data = {
-                "ttl_loss": ttl_loss.item(),
-                "tent_loss": tent_loss.item(),
-                "kl_loss": kl_loss.item(),
-                "batch_avg_nll": per_sample_nll.mean().item(),
-                "training_mode": training_mode,
-                "cumulative_selected_samples": float(self.cumulative_selected_samples),
-            }
-
-            if per_sample_ppl is not None:
-                log_data["batch_avg_ppl"] = per_sample_ppl.mean().item()
-
-            self.log(log_data)
-
-        # 🚀 优化11: 大幅减少token级日志频率
-        token_log_freq = getattr(self.finetuning_args, "token_log_freq", 50)
-        if self.is_in_train and self.state.global_step % (self.args.logging_steps * token_log_freq) == 0:
-            log_entry = {
-                "input": {
-                    "tokens": shift_labels.detach().cpu(),
-                    "nll": per_token_nll_input.detach().cpu(),
-                    "mask": mask.detach().cpu().bool(),
-                }
-            }
-
-            if generated_tokens is not None and entropy is not None:
-                log_entry["generated"] = {
-                    "tokens": entropy_tokens.detach().cpu(),
-                    "entropy": entropy.detach().cpu(),
-                    "mask": entropy_mask.detach().cpu().bool(),
-                }
-
-            self.token_log.append(log_entry)
-
-        # Store individual losses
-        if not hasattr(self, "_custom_losses"):
-            self._custom_losses = {"ttl_loss": [], "tent_loss": [], "kl_loss": []}
-        self._custom_losses["ttl_loss"].append(ttl_loss.item())
-        self._custom_losses["tent_loss"].append(tent_loss.item())
-        self._custom_losses["kl_loss"].append(kl_loss.item())
+        # 训练时可选日志（频率由外部控制）
+        if self.is_in_train and "input_ids" in inputs:
+            # 可按需扩展 token 级日志；这里保留最小记录，避免显存负担
+            pass
 
         return (total_loss, outputs) if return_outputs else total_loss
+
+    # ------------------------ 辅助：CE ------------------------- #
+    @torch.no_grad()
+    def _cal_ce(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """对输入 tokens 计算 sentence 级交叉熵（忽略 IGNORE_INDEX），等价于负对数似然。"""
+        criterion = CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
+        shift_logits = logits[..., :-1, :]  # [B, L-1, V]
+        shift_labels = labels[..., 1:]  # [B, L-1]
+        loss = criterion(
+            shift_logits.contiguous().view(-1, shift_logits.size(-1)),
+            shift_labels.contiguous().view(-1),
+        ).view(shift_labels.size())  # [B, L-1]
+        mask = (shift_labels != IGNORE_INDEX).to(loss.dtype)
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        sent_ce = (loss * mask).sum(dim=1) / denom
+        return sent_ce  # [B]
+
+    # ------------------------ 辅助：TENT 预计算序列 ------------------------- #
+    def _get_pad_eos_ids(self):
+        pad_id = getattr(self.processing_class, "pad_token_id", None)
+        eos_id = getattr(self.processing_class, "eos_token_id", None)
+        if pad_id is None and hasattr(self, "tokenizer") and self.tokenizer is not None:
+            pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if eos_id is None and hasattr(self, "tokenizer") and self.tokenizer is not None:
+            eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        if pad_id is None:
+            pad_id = 0
+        if eos_id is None:
+            eos_id = 0
+        return pad_id, eos_id
+
+    def _pad_and_stack(self, sequences: List[List[int]], pad_id: int, device, dtype) -> torch.Tensor:
+        bsz = len(sequences)
+        max_len = max((len(s) for s in sequences), default=0)
+        if max_len == 0:
+            return torch.full((bsz, 0), pad_id, dtype=dtype, device=device)
+        out = torch.full((bsz, max_len), pad_id, dtype=dtype, device=device)
+        for i, s in enumerate(sequences):
+            if len(s) > 0:
+                out[i, : len(s)] = torch.tensor(s, dtype=dtype, device=device)
+        return out
+
+    def _fetch_precomputed_continuations(
+        self, bsz: int, limit: Optional[int], pad_id: int, device, dtype
+    ) -> torch.Tensor:
+        """按 batch 顺序从 self.precomputed_predictions 中取出 bsz 条，裁剪到 limit，并 pad 成 [B, Lmax]。"""
+        cont_list: List[List[int]] = []
+        for _ in range(bsz):
+            if self.precomputed_predictions is not None and self._precompute_ptr < len(self.precomputed_predictions):
+                seq = self.precomputed_predictions[self._precompute_ptr]
+                self._precompute_ptr += 1
+            else:
+                seq = []
+            if limit is not None and limit > 0:
+                seq = seq[:limit]
+            cont_list.append(seq)
+        return self._pad_and_stack(cont_list, pad_id=pad_id, device=device, dtype=dtype)

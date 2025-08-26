@@ -42,9 +42,9 @@ GPU_MEMORY_UTILIZATION="0.92"
 
 ### 流程控制开关 ###
 DO_TRAIN="true"
-DO_INFER="true"
-DO_EVAL="true"
-MAX_TRAIN_JOBS_PER_GPU=2
+DO_INFER="false"
+DO_EVAL="false"
+MAX_TRAIN_JOBS_PER_GPU=1
 MAX_EVAL_JOBS_PER_GPU=10
 
 # === 覆盖开关（是否无视已有产物并重跑）===
@@ -58,7 +58,10 @@ LAUNCH_DELAY_SECONDS=1
 
 # =========== TTL 设置（与 YAML 对齐，使用列表进行组合实验） ===========
 TTL_SETTING_LIST=("offline_ttl")
-TTL_REF_MODE_LIST=("precompute" "simultaneous")
+TTL_REF_MODE_LIST=(
+  "precompute" 
+  #"simultaneous"
+)
 TTL_REF_BATCH_SIZE_LIST=(1)
 TTL_ENABLE_INFERENCE_LIST=("false")
 TTL_THRESHOLD_LIST=(3)
@@ -70,12 +73,10 @@ methods=(
   # "base"   # 仅推理；不使用LoRA；结果保存到 <RESULTS_BASE_DIR>/base
   # "ttlu"
   # "ttl"
-  "tent"
-  "eata"
-  "eata_sdiv"
-  # "ttltent"
-  # "ttltent_ppl_nll"
-  # "ttltent_nll_nll"
+  # "tent"
+  # "eata"
+  # "eata_sdiv"
+  "ttltent"
   # "sft"
 )
 
@@ -116,26 +117,43 @@ datasets=(
 
 gpus=(
   0
-  1
-  2
-  4
+  # 1
+  # 2
+  # 4
 )
 
-# ===== LoRA 目标组合：新增维度（attn | ffn | attn_ffn）=====
+# ===== LoRA 目标组合：新增维度（attn | ffn | attn_ffn | lm_head | attn_lm_head | ffn_lm_head | attn_ffn_lm_head）=====
 LORA_TARGET_MODE_LIST=(
-  # "attn" 
-  "ffn" 
-  "attn_ffn"
+  # "attn"
+  # "ffn"
+  # "attn_ffn"
+  "lm_head"
+  # "attn_lm_head"
+  # "ffn_lm_head"
+  # "attn_ffn_lm_head"
 )
+
 # 说明：映射到具体 target 名（适配 Qwen2.5 命名）
+# 支持 "logits" 作为 "lm_head" 的别名，方便命令行直觉输入
 resolve_lora_target() {
   case "$1" in
     "attn") echo "q_proj,v_proj" ;;
     "ffn") echo "up_proj,down_proj,gate_proj" ;;
     "attn_ffn") echo "q_proj,v_proj,up_proj,down_proj,gate_proj" ;;
-    *) echo "$1" ;; # 允许直接传自定义 target 字符串
+
+    # 新增：只改 lm_head（logits）
+    "lm_head"|"logits") echo "lm_head" ;;
+
+    # 新增：与 attn / ffn 的组合
+    "attn_lm_head") echo "q_proj,v_proj,lm_head" ;;
+    "ffn_lm_head") echo "up_proj,down_proj,gate_proj,lm_head" ;;
+    "attn_ffn_lm_head") echo "q_proj,v_proj,up_proj,down_proj,gate_proj,lm_head" ;;
+
+    # 允许直接传自定义 target 字符串（逗号分隔）
+    *) echo "$1" ;;
   esac
 }
+
 # LoRA 标签后缀（用于命名）
 lora_suffix_for() {
   local method="$1"
@@ -149,8 +167,14 @@ lora_suffix_for() {
 # ===== 将关键开关改为“列表 + 迭代”，方便做 ablation =====
 USE_FULL_ENTROPY_IN_GENERATION_LIST=("false")
 # 注意：bash 数组不要用逗号分隔
-EATA_SELECT_HIGH_ENTROPY_LIST=("true" "false")  # 仅对 eata/eata_sdiv 生效
-USE_EMFT_LOSS_LIST=("true" "false")
+EATA_SELECT_HIGH_ENTROPY_LIST=(
+  "true" 
+  #"false"
+)  # 仅对 eata/eata_sdiv 生效
+USE_EMFT_LOSS_LIST=(
+  "true"
+  #"false"
+)  # 对 ttl/ttlu 无效（见下方过滤与注入逻辑）
 # 生成模型模式（适用于名字包含 "tent"/"eata" 的方法）："simultaneous" 或 "precompute"
 GEN_MODEL_LIST=("precompute")
 
@@ -267,8 +291,11 @@ get_suffix() {
     fi
   fi
 
+  # EMFT 后缀：对 ttl/ttlu 无效（不加后缀）
   if [[ "${method}" != "sft" && "${USE_EMFT_LOSS}" == "true" ]]; then
-    suffix+="_emft"
+    if ! method_is_ttl_only "${method}" && ! method_is_ttlu_like "${method}"; then
+      suffix+="_emft"
+    fi
   fi
 
   if [[ "$method" == ttltent* ]]; then
@@ -422,13 +449,15 @@ run_train() {
     train_args+=("overwrite_output_dir=true")
   fi
 
-  # 仅 ttl/ttlu 注入 TTL 参数；ttlu 额外注入 ref_* 配置；非 TTL 方法不出现任何 ttl_* 参数
-  if [[ "${stage_to_run}" == "ttl" || "${stage_to_run}" == "ttlu" ]]; then
+  # 仅 ttl/ttlu/ttltent 注入 TTL 参数；
+  # ttlu 和 ttltent 额外注入 ref_* 配置；
+  # 非 TTL 方法不出现任何 ttl_* 参数
+  if [[ "${stage_to_run}" == "ttl" || "${stage_to_run}" == "ttlu" || "${stage_to_run}" == "ttltent" ]]; then
     train_args+=("ttl_setting=${TTL_SETTING}")
     train_args+=("ttl_threshold=${TTL_THRESHOLD}")
     train_args+=("ttl_sample_efficiency_scaler=${TTL_SCALER}")
     train_args+=("ttl_streaming_batch_size=${TTL_STREAMING_BATCH_SIZE}")
-    if [[ "${stage_to_run}" == "ttlu" ]]; then
+    if [[ "${stage_to_run}" == "ttlu" || "${stage_to_run}" == "ttltent" ]]; then
       train_args+=("ttl_ref_mode=${TTL_REF_MODE}")
       train_args+=("ttl_ref_batch_size=${TTL_REF_BATCH_SIZE}")
       train_args+=("ttl_direct_inference=${TTL_ENABLE_INFERENCE}")
@@ -461,7 +490,8 @@ run_train() {
     train_args+=("kl_weight=${KL_WEIGHT}")
   fi
 
-  if [[ "${stage_to_run}" != "sft" && "${USE_EMFT_LOSS}" == "true" ]]; then
+  # EMFT 注入：对 ttl/ttlu 无效（不注入）
+  if [[ "${stage_to_run}" != "sft" && "${USE_EMFT_LOSS}" == "true" && "${stage_to_run}" != "ttl" && "${stage_to_run}" != "ttlu" ]]; then
     train_args+=("use_emft_loss=true")
   fi
 
@@ -914,6 +944,10 @@ for MODEL_KEY in "${models[@]}"; do
                                            || "${KL_WEIGHT}" != "${DEFAULT_KL_WEIGHT}" ]]; then
                                           continue
                                         fi
+                                      fi
+                                      # EMFT 对 ttl/ttlu 无效：若方法为 ttl/ttlu 且 USE_EMFT_LOSS 非默认，则跳过该组合
+                                      if ( method_is_ttl_only "${method}" || method_is_ttlu_like "${method}" ) && [[ "${USE_EMFT_LOSS}" != "${DEFAULT_USE_EMFT_LOSS}" ]]; then
+                                        continue
                                       fi
 
                                       for dataset in "${interleaved_datasets[@]}"; do
