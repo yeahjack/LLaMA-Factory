@@ -63,11 +63,11 @@ TTL_STREAMING_BATCH_SIZE_LIST=(100)
 # =========== 实验变量配置 ===========
 methods=(
   # "base"   # 仅推理；不使用LoRA；结果保存到 <RESULTS_BASE_DIR>/base
-  "ttlu"
+  # "ttlu"
   # "ttl"
-  # "tent"
-  # "eata"
-  # "eata_sdiv"
+  "tent"
+  "eata"
+  "eata_sdiv"
   # "ttltent"
   # "ttltent_ppl_nll"
   # "ttltent_nll_nll"
@@ -75,14 +75,14 @@ methods=(
 )
 
 generation_lens=(
-  0
+  # 0
   # 1
   # 4
   # 8
   # 16
   # 32
   # 64
-  # -1
+  -1
   # 80
 )
 
@@ -118,7 +118,7 @@ gpus=(
 
 # ===== LoRA 目标组合：新增维度（attn | ffn | attn_ffn）=====
 LORA_TARGET_MODE_LIST=(
-  "attn" 
+  # "attn" 
   "ffn" 
   "attn_ffn"
   )
@@ -873,9 +873,10 @@ for MODEL_KEY in "${models[@]}"; do
                                       if [[ "${method}" != "eata" && "${method}" != "eata_sdiv" ]] && [[ "${EATA_SELECT_HIGH_ENTROPY}" != "${DEFAULT_EATA_SELECT_HIGH_ENTROPY}" ]]; then
                                         continue
                                       fi
-                                      # 仅非 sft 方法有效的 USE_EMFT_LOSS；sft 无效时固定为默认以去重
-                                      if [[ "${stage_for_m}" == "sft" && "${USE_EMFT_LOSS}" != "${DEFAULT_USE_EMFT_LOSS}" ]]; then
-                                        continue
+                                      # 只有 tent/emft 家族才真正传入 use_emft_loss
+                                      if [[ ( "${method}" == *tent* || "${method}" == *emft* ) && \
+                                            "${USE_EMFT_LOSS}" == "true" ]]; then
+                                        train_args+=("use_emft_loss=true")
                                       fi
                                       # 仅 tent/eata 家族允许切换 GEN_MODEL
                                       if [[ "${method}" != *tent* && "${method}" != *eata* ]] && [[ "${GEN_MODEL}" != "${DEFAULT_GEN_MODEL}" ]]; then
