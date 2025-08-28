@@ -12,14 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import annotations
-
 import json
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Optional
 
 import torch
-from tqdm.auto import tqdm
 
 from ...data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
 from ...extras.constants import IGNORE_INDEX
@@ -40,16 +37,20 @@ logger = get_logger(__name__)
 
 
 def _add_example_id_column(ds):
+    """为 HuggingFace Dataset 添加 example_id 列，用于索引预计算 CE。."""
     try:
         if "example_id" in ds.column_names:
             return ds
         return ds.add_column("example_id", list(range(len(ds))))
     except Exception:
+        # 兜底：IterableDataset 或不支持 add_column 的情况，退回原 ds（此时 precompute 会报错提示）
         return ds
 
 
 def _wrap_collator_with_ids(base_collator):
-    def _fn(features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    """包装 collator，把 example_id 拼进 batch；保持对原有键的完全透明。."""
+
+    def _fn(features: list[dict]) -> dict:
         batch = base_collator(features)
         if isinstance(batch, tuple):
             batch = batch[0]
@@ -65,13 +66,16 @@ def _wrap_collator_with_ids(base_collator):
 
 
 def _predict_and_save_jsonl(trainer: TTLTENTTrainer, dataset, tokenizer, out_dir: str, gen_args) -> None:
+    """可选推理：对 dataset 生成并保存 JSONL（prompt/label/predict）."""
     os.makedirs(out_dir, exist_ok=True)
 
+    # 生成参数
     gen_kwargs = gen_args.to_dict()
     gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id] + tokenizer.additional_special_tokens_ids
     gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
     gen_kwargs["logits_processor"] = get_logits_processor()
 
+    # 生成阶段：decoder-only 需左填充
     pad_backup = tokenizer.padding_side
     tokenizer.padding_side = "left"
     predict_with_generate_backup = trainer.args.predict_with_generate
@@ -79,13 +83,16 @@ def _predict_and_save_jsonl(trainer: TTLTENTTrainer, dataset, tokenizer, out_dir
 
     preds = trainer.predict(dataset, metric_key_prefix="predict", **gen_kwargs)
 
+    # 还原设置
     trainer.args.predict_with_generate = predict_with_generate_backup
     tokenizer.padding_side = pad_backup
 
+    # 将预测、输入、标签解码并落盘
     token_pad_id = tokenizer.pad_token_id
     label_ids = preds.label_ids
     pred_ids = preds.predictions
 
+    # 顺序处理 pad：把左侧 pad 移到末尾，便于解码
     for i in range(len(pred_ids)):
         arr = pred_ids[i]
         nz = (arr != token_pad_id).nonzero()
@@ -108,19 +115,20 @@ def _predict_and_save_jsonl(trainer: TTLTENTTrainer, dataset, tokenizer, out_dir
     logger.info_rank0(f"Saved prediction results to {out_file}")
 
 
-@torch.no_grad()
 def _precompute_reference_ce(
     trainer: TTLTENTTrainer,
     dataset,
     batch_size: int,
-    log_path: str | None = None,
+    log_path: Optional[str] = None,
 ) -> None:
+    """在 workflow 中执行参考 CE 的预计算（用 base 模型），写入 trainer.ref_sentence_ce。."""
     from contextlib import nullcontext as _nullctx
 
     assert hasattr(trainer, "data_collator"), "TTLTENTTrainer 需要 data_collator 才能预计算参考 CE。"
     model = trainer.model
     model.eval()
 
+    # 临时覆盖 per_device_eval_batch_size
     old_pdev_bs = getattr(trainer.args, "per_device_eval_batch_size", None)
     try:
         trainer.args.per_device_eval_batch_size = max(1, int(batch_size))
@@ -133,6 +141,7 @@ def _precompute_reference_ce(
         if old_pdev_bs is not None:
             trainer.args.per_device_eval_batch_size = old_pdev_bs
 
+    # 若是 PEFT/LoRA，关闭 adapter，用基座权重前向
     base_model_ctx = getattr(trainer.accelerator.unwrap_model(model), "disable_adapter", None)
     base_ctx = base_model_ctx() if base_model_ctx is not None else _nullctx()
 
@@ -140,17 +149,23 @@ def _precompute_reference_ce(
     total_seen = 0
 
     show_bar = trainer.is_world_process_zero()
-    try:
-        total_examples = len(dataset)
-    except Exception:
-        total_examples = None
-    pbar = (
-        tqdm(total=total_examples, dynamic_ncols=True, unit="ex", desc="[TTLTENT] Precompute CE", leave=True)
-        if show_bar
-        else None
-    )
+    pbar = None
+    total_examples = None
+    if show_bar:
+        try:
+            total_examples = len(dataset)
+        except Exception:
+            total_examples = None
+        from tqdm.auto import tqdm as _tqdm
 
-    with base_ctx:
+        if total_examples is not None:
+            pbar = _tqdm(
+                total=total_examples, dynamic_ncols=True, unit="ex", desc="[TTLTENT] Precompute CE", leave=True
+            )
+        else:
+            pbar = _tqdm(dynamic_ncols=True, unit="batch", desc="[TTLTENT] Precompute CE", leave=True)
+
+    with base_ctx, torch.no_grad():
         for batch in dataloader:
             input_ids = batch["input_ids"].to(model.device)
             attn = batch.get("attention_mask", None)
@@ -160,44 +175,41 @@ def _precompute_reference_ce(
             outputs = model(input_ids=input_ids, attention_mask=attn)
             logits = outputs["logits"]
 
+            # 屏蔽 pad 与句首
+            labels_eff = input_ids.clone()
             if attn is not None:
-                P = attn.size(1)
-                ttl_logits = logits[:, : P - 1, :]
-                ttl_labels = input_ids[:, 1:P]
-                criterion = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
-                ttl_token_nll = criterion(
-                    ttl_logits.reshape(-1, ttl_logits.size(-1)),
-                    ttl_labels.reshape(-1),
-                ).view(ttl_labels.size())
-                ttl_mask = (attn[:, 1:P] != 0).to(ttl_token_nll.dtype)
-                ttl_denom = ttl_mask.sum(dim=1).clamp_min(1.0)
-                sent_ce = (ttl_token_nll * ttl_mask).sum(dim=1) / ttl_denom
-            else:
-                criterion = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
-                ttl_token_nll = criterion(
-                    logits[:, :-1, :].reshape(-1, logits.size(-1)),
-                    input_ids[:, 1:].reshape(-1),
-                ).view(input_ids.size(0), -1)
-                ttl_mask = torch.ones_like(ttl_token_nll)
-                ttl_denom = ttl_mask.sum(dim=1).clamp_min(1.0)
-                sent_ce = (ttl_token_nll * ttl_mask).sum(dim=1) / ttl_denom
+                labels_eff = labels_eff.masked_fill(attn == 0, IGNORE_INDEX)
+            labels_eff[:, 0] = IGNORE_INDEX
+
+            # sentence CE
+            criterion = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
+            shift_logits = logits[..., :-1, :]  # [B, L-1, V]
+            shift_labels = labels_eff[..., 1:]  # [B, L-1]
+            loss = criterion(
+                shift_logits.contiguous().view(-1, shift_logits.size(-1)),
+                shift_labels.contiguous().view(-1),
+            ).view(shift_labels.size())  # [B, L-1]
+            mask = (shift_labels != IGNORE_INDEX).to(loss.dtype)
+            denom = mask.sum(dim=1).clamp(min=1.0)
+            ce = (loss * mask).sum(dim=1) / denom  # [B]
 
             ex_ids = batch["example_id"]
             if isinstance(ex_ids, torch.Tensor):
                 ex_ids = ex_ids.tolist()
-            for eid, val in zip(ex_ids, sent_ce.detach().cpu().tolist()):
+
+            for eid, val in zip(ex_ids, ce.detach().cpu().tolist()):
                 trainer.ref_sentence_ce[int(eid)] = float(val)
 
-            bsz = len(ex_ids)
-            total_seen += bsz
+            batch_size_now = len(ex_ids)
+            total_seen += batch_size_now
             if pbar is not None:
                 if total_examples is not None:
-                    pbar.update(bsz)
                     left = max(total_examples - total_seen, 0)
-                    pbar.set_postfix({"seen": total_seen, "left": left, "bs": bsz})
+                    pbar.update(batch_size_now)
+                    pbar.set_postfix({"seen": total_seen, "left": left, "bs": batch_size_now})
                 else:
                     pbar.update(1)
-                    pbar.set_postfix({"seen": total_seen, "bs": bsz})
+                    pbar.set_postfix({"seen": total_seen, "bs": batch_size_now})
 
     if pbar is not None:
         pbar.close()
@@ -211,9 +223,10 @@ def _precompute_reference_ce(
 
 def _load_precomputed_predictions_if_needed(
     tokenizer, data_args, finetuning_args, dataset_module
-) -> tuple[str, list[list[int]] | None]:
+) -> tuple[str, Optional[list[list[int]]]]:
+    """在 gen_model=precompute 时，从 jsonl 加载 predict -> token ids 列表。."""
     gen_model_mode = str(getattr(finetuning_args, "gen_model", "simultaneous")).lower()
-    precomputed_predictions: list[list[int]] | None = None
+    precomputed_predictions: Optional[list[list[int]]] = None
     dataset_name = None
 
     if gen_model_mode == "precompute":
@@ -225,8 +238,14 @@ def _load_precomputed_predictions_if_needed(
             logger.warning_rank0(f"Could not set disable_shuffling: {e}")
 
         try:
-            if hasattr(data_args, "dataset") and isinstance(data_args.dataset, list) and len(data_args.dataset) > 0:
-                dataset_name = data_args.dataset[0]
+            if hasattr(data_args, "dataset") and isinstance(data_args, list) and len(data_args) > 0:
+                dataset_name = data_args[0]  # type: ignore
+            elif (
+                hasattr(data_args, "dataset")
+                and isinstance(getattr(data_args, "dataset"), list)
+                and len(getattr(data_args, "dataset")) > 0
+            ):
+                dataset_name = getattr(data_args, "dataset")[0]
             else:
                 dataset_name = "train_dataset"
         except Exception as e:
@@ -281,17 +300,24 @@ def _load_precomputed_predictions_if_needed(
 
 
 def run_ttltent(
-    model_args: ModelArguments,
-    data_args: DataArguments,
-    training_args: Seq2SeqTrainingArguments,
-    finetuning_args: FinetuningArguments,
-    generating_args: GeneratingArguments,
-    callbacks: list[TrainerCallback] | None = None,
+    model_args: "ModelArguments",
+    data_args: "DataArguments",
+    training_args: "Seq2SeqTrainingArguments",
+    finetuning_args: "FinetuningArguments",
+    generating_args: "GeneratingArguments",
+    callbacks: Optional[list["TrainerCallback"]] = None,
 ):
+    """Main workflow for combined TTL-TENT adaptation.
+    - TTL：输入序列的句子级 CE（自监督）
+    - TENT：生成序列的熵最小化（或整段，无生成时）
+    - KL：reverse-KL(student‖teacher)，仅在 generation 段.
+    """
+    # tokenizer 与模板
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
 
+    # 数据集（TTL 阶段）
     dataset_module = get_dataset(
         template,
         model_args,
@@ -301,40 +327,65 @@ def run_ttltent(
         **tokenizer_module,
     )
 
+    # 训练/评估集，附加 example_id
     train_dataset = dataset_module.get("train_dataset")
     eval_dataset = dataset_module.get("eval_dataset") or train_dataset
     train_dataset = _add_example_id_column(train_dataset)
     eval_dataset = _add_example_id_column(eval_dataset)
 
+    # 模型
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
     if getattr(model, "is_quantized", False) and not training_args.do_train:
         setattr(model, "_hf_peft_config_loaded", True)
 
+    # collator：右填充训练；并用包装器保证 example_id 进入 batch
     tokenizer.padding_side = "right"
-    training_args.remove_unused_columns = False
+    training_args.remove_unused_columns = False  # 防止删掉 example_id
     base_collator = SFTDataCollatorWith4DAttentionMask(
         template=template,
         pad_to_multiple_of=None,
-        label_pad_token_id=(IGNORE_INDEX if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id),
-        block_diag_attn=model_args.block_diag_attn,
+        label_pad_token_id=(
+            IGNORE_INDEX if getattr(data_args, "ignore_pad_token_for_loss", False) else tokenizer.pad_token_id
+        ),
+        block_diag_attn=getattr(model_args, "block_diag_attn", False),
         attn_implementation=getattr(model.config, "_attn_implementation", None),
-        compute_dtype=model_args.compute_dtype,
+        compute_dtype=getattr(model_args, "compute_dtype", None),
         **tokenizer_module,
     )
     data_collator = _wrap_collator_with_ids(base_collator)
 
+    # 禁用 HF 的自动生成评测（TENT/TTLTENT 阶段不需要）
     if training_args.predict_with_generate:
         logger.warning_once("`predict_with_generate` is not supported in TTL-TENT stage.")
         training_args.predict_with_generate = False
 
+    # Monkey-patch forward 以传回 input_ids（并去除 labels 以避免监督损失），与上游保持兼容
+    orig_forward = model.forward
+
+    def forward_with_ids(*args, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        if "labels" in kwargs:
+            kwargs = {k: v for k, v in kwargs.items() if k != "labels"}
+        outputs = orig_forward(
+            *args,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
+        outputs["input_ids"] = input_ids
+        return outputs
+
+    model.forward = forward_with_ids
+
+    # 如果需要，加载预计算的生成序列（给 TENT 使用）
     dataset_name, precomputed_predictions = _load_precomputed_predictions_if_needed(
         tokenizer=tokenizer,
-        data_args=data_args,
+        data_args=getattr(data_args, "dataset", None),
         finetuning_args=finetuning_args,
         dataset_module=dataset_module,
     )
     gen_model_mode = getattr(finetuning_args, "gen_model", "simultaneous")
 
+    # 初始化 Trainer
     trainer = TTLTENTTrainer(
         finetuning_args=finetuning_args,
         model=model,
@@ -348,6 +399,7 @@ def run_ttltent(
         gen_model_mode=gen_model_mode,
     )
 
+    # 若需要，预计算 TTL 参考 CE（一次性，用 base 模型；无需维护两份权重）
     if str(getattr(finetuning_args, "ttl_ref_mode", "precompute")).lower() == "precompute":
         log_path = os.path.join(training_args.output_dir, "ttltent_ttl_log.txt")
         _precompute_reference_ce(
@@ -357,21 +409,28 @@ def run_ttltent(
             log_path=log_path,
         )
 
+    # 是否在 TTL-TENT 阶段直接做推理（与 TTLU 对齐提供此选项）
     direct_infer: bool = bool(getattr(finetuning_args, "ttl_direct_inference", False))
+
+    # 两种总体流程（与 TTLU 对齐）
     setting = getattr(finetuning_args, "ttl_setting", "offline_ttl").lower()
     if setting not in {"offline_ttl", "online_ttl"}:
         raise ValueError(f"Unsupported ttl_setting: {setting}")
 
+    # 离线：先训后（可选）推
     if setting == "offline_ttl":
         if training_args.do_train:
             logger.info_rank0("Starting TTLTENT (offline) training...")
             train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
             trainer.save_model()
+            # 保存自定义图表（与 save 同目录）
+            trainer.export_diagnostics_plots(training_args.output_dir)
+
             trainer.log_metrics("train", train_result.metrics)
             trainer.save_metrics("train", train_result.metrics)
             trainer.save_state()
 
-            if trainer.is_world_process_zero() and finetuning_args.plot_loss:
+            if trainer.is_world_process_zero() and getattr(finetuning_args, "plot_loss", False):
                 plot_loss(training_args.output_dir, keys=["loss"])
 
         if direct_infer:
@@ -381,12 +440,13 @@ def run_ttltent(
             )
             _predict_and_save_jsonl(trainer, eval_dataset, tokenizer, pred_out, generating_args)
 
+    # 在线：分片「先推再训」或「只训」，每片各自保存 LoRA
     else:
         bs = int(getattr(finetuning_args, "ttl_streaming_batch_size", 100))
         n = len(train_dataset)
         num_batches = n // bs + (1 if n % bs != 0 else 0)
-        base_out = training_args.output_dir
 
+        base_out = training_args.output_dir
         for k in range(num_batches):
             start, end = k * bs, min((k + 1) * bs, n)
             logger.info_rank0(f"[TTLTENT] Processing streaming batch {k + 1}/{num_batches}: [{start}, {end})")
@@ -394,13 +454,16 @@ def run_ttltent(
             sub_train = train_dataset.select(range(start, end))
             sub_eval = eval_dataset.select(range(start, end))
 
+            # 重新绑定当前子数据集
             trainer.train_dataset = sub_train
             trainer.eval_dataset = sub_eval
 
+            # 子片输出目录
             sub_out = os.path.join(base_out, f"online_step_{k:04d}")
             trainer.args.output_dir = sub_out
             os.makedirs(sub_out, exist_ok=True)
 
+            # 需要推理则先推
             if direct_infer:
                 pred_out = os.path.join(
                     sub_out,
@@ -408,40 +471,25 @@ def run_ttltent(
                 )
                 _predict_and_save_jsonl(trainer, sub_eval, tokenizer, pred_out, generating_args)
 
+            # 训练该子片
             train_result = trainer.train(resume_from_checkpoint=None)
-            trainer.save_model()
+            trainer.save_model()  # 保存该子片对应的 LoRA/adapter
+
+            # 保存自定义图表到该子目录
+            trainer.export_diagnostics_plots(sub_out)
+
             trainer.log_metrics(f"train_stream_{k}", train_result.metrics)
             trainer.save_metrics(f"train_stream_{k}", train_result.metrics)
             trainer.save_state()
 
+        # 训练结束把输出目录恢复
         trainer.args.output_dir = base_out
 
+    # 训练或评估结束：常规评估（如果打开）
     if training_args.do_eval:
         metrics = trainer.evaluate(metric_key_prefix="eval")
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
-    # 将 token_log 以 JSON 数组形式保存（与 TENT/EATA 保持一致的 .json 文件）
-    if trainer.is_world_process_zero():
-        try:
-            out_file = os.path.join(training_args.output_dir, "token_entropy_details.json")
-            rows = []
-            for rec in trainer.token_log:
-                prompt_text = tokenizer.decode(rec.get("prompt_token_ids", []), skip_special_tokens=True)
-                gen_text = tokenizer.decode(rec.get("generated_token_ids", []), skip_special_tokens=True)
-                rows.append(
-                    {
-                        "example_id": rec.get("example_id", -1),
-                        "prompt_text": prompt_text,
-                        "generated_text": gen_text,
-                        "prompt_token_nll": rec.get("prompt_token_nll", []),
-                        "generation_token_entropy": rec.get("generation_token_entropy", []),
-                    }
-                )
-            with open(out_file, "w", encoding="utf-8") as f:
-                json.dump(rows, f, indent=2, ensure_ascii=False)
-            logger.info_rank0(f"Token-entropy details saved to {out_file}")
-        except Exception as e:
-            logger.warning_rank0(f"Failed to save token-entropy details: {e}")
-
+    # 卡片与推送
     create_modelcard_and_push(trainer, model_args, data_args, training_args, finetuning_args)

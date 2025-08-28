@@ -647,6 +647,24 @@ class FinetuningArguments(
         default=0.1,
         metadata={"help": "Weight for KL regularization loss. Only effective when use_kl_regularization=True."},
     )
+    # TTL/TENT 样本门控（gating）模式：
+    # - "all"  ：同时对 TTL 与 TENT 按参考 CE 阈值进行门控；TTL 端带权重、TENT 端仅筛选不加权
+    # - "ttl"  ：仅对 TTL 门控（带权重），TENT 不做门控
+    # - "tent" ：仅对 TENT 门控（仅筛选不加权），TTL 不做门控
+    # - "none" ：两侧都不做门控；同时 TTL 端也**不使用 coeff**（退化为简单均值）
+    gating: Literal["all", "ttl", "tent", "none"] = field(
+        default="ttl",
+        metadata={
+            "help": (
+                "Gating mode for TTL/TENT based on sentence-level cross-entropy threshold. "
+                "'all': gate both TTL (with weight) and TENT (selection only); "
+                "'ttl': gate only TTL (with weight); "
+                "'tent': gate only TENT (selection only); "
+                "'none': disable gating for both; TTL also disables coeff (simple mean)."
+            )
+        },
+    )
+
 
     def __post_init__(self):
         def split_arg(arg):
