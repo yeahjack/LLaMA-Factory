@@ -42,8 +42,8 @@ GPU_MEMORY_UTILIZATION="0.92"
 
 ### 流程控制开关 ###
 DO_TRAIN="true"
-DO_INFER="false"
-DO_EVAL="false"
+DO_INFER="true"
+DO_EVAL="true"
 MAX_TRAIN_JOBS_PER_GPU=2
 MAX_EVAL_JOBS_PER_GPU=10
 
