@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext as _nullctx
 from typing import TYPE_CHECKING
 
 import torch
@@ -49,7 +50,7 @@ class _BaseBalancer(nn.Module):
 
     def compute_weights(
         self,
-        trainer: TTLTENTTrainer,
+        trainer: "TTLTENTTrainer",
         base_w_ttl: float,
         base_w_tent: float,
         ttl_loss: torch.Tensor,
@@ -158,7 +159,7 @@ class _UncertaintyBalancer(_BaseBalancer):
         return w_ttl, w_tent, extra
 
 
-def _build_balancer(fa: FinetuningArguments) -> _BaseBalancer:
+def _build_balancer(fa: FinetuningArguments) -> _BaseBalancer | None:
     name = str(getattr(fa, "loss_balancing_method", "static")).lower()
     if name in ("static", "st"):
         return _StaticBalancer()
@@ -176,8 +177,7 @@ def _build_balancer(fa: FinetuningArguments) -> _BaseBalancer:
         c = float(getattr(fa, "as_ceil", 1e3))
         return _AdaptiveScalingBalancer(floor=f, ceil=c)
     if name in ("uncertainty", "uc"):
-        # 实例化时需要 trainer 以注册可学习参数；先占位，真正构造在 Trainer.__init__ 里完成
-        return None  # type: ignore
+        return None  # 占位：由 Trainer 在 __init__ 内实例化（需要注册参数）
     logger.warning_rank0(f"Unknown loss_balancing_method={name}, fallback to static.")
     return _StaticBalancer()
 
@@ -218,16 +218,29 @@ class TTLTENTTrainer(Seq2SeqTrainer):
             except Exception as e:
                 logger.warning_rank0(f"Could not set padding_side: {e}")
 
-        # Teacher for reverse-KL (always enabled if generation_len>0)
+        # === 教师构造策略：优先 disable_adapter，避免 deepcopy 造成显存浪费 ===
         try:
-            self.teacher: nn.Module | None = copy.deepcopy(self.model)
-            for p in self.teacher.parameters():
-                p.requires_grad_(False)
-            self.teacher.eval()
-            logger.info_rank0("[TTLTENT] Teacher model created for reverse-KL.")
-        except Exception as e:
-            logger.warning_rank0(f"Failed to copy teacher model (KL will be disabled): {e}")
-            self.teacher = None
+            unwrapped = getattr(self.accelerator, "unwrap_model", lambda x: x)(self.model)
+            has_disable = getattr(unwrapped, "disable_adapter", None) is not None
+        except Exception:
+            unwrapped = self.model
+            has_disable = False
+
+        if has_disable:
+            # 使用 LoRA 的 disable_adapter() 作为教师路径；不创建 teacher 副本
+            self.teacher: nn.Module | None = None
+            logger.info_rank0("[TTLTENT] Using disable_adapter() for teacher path. No deepcopy allocated.")
+        else:
+            # 回退：深拷贝一份冻结教师
+            try:
+                self.teacher = copy.deepcopy(self.model)
+                for p in self.teacher.parameters():
+                    p.requires_grad_(False)
+                self.teacher.eval()
+                logger.info_rank0("[TTLTENT] Teacher model created via deepcopy (fallback).")
+            except Exception as e:
+                logger.warning_rank0(f"Failed to copy teacher model (KL may be disabled): {e}")
+                self.teacher = None
 
         # Balancer
         base_balancer = _build_balancer(self.finetuning_args)
@@ -317,6 +330,49 @@ class TTLTENTTrainer(Seq2SeqTrainer):
                 seq = seq[:limit]
             cont_list.append(seq)
         return self._pad_and_stack(cont_list, pad_id=pad_id, device=device, dtype=dtype)
+
+    def _concat_prompt_with_continuations(
+        self,
+        input_ids: torch.Tensor,  # [B, Pmax]
+        attn: torch.Tensor | None,  # [B, Pmax] or None
+        cont: torch.Tensor,  # [B, Cmax] (right-padded)
+        pad_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        将每个样本的真实 prompt（去除右侧 PAD）与该样本的续写拼接，返回：
+          - generated_tokens: [B, Tmax]
+          - attention_mask_gen: [B, Tmax]
+          - prompt_lens: [B]（每条样本真实 prompt 长度）
+        """
+        device = input_ids.device
+        B = input_ids.size(0)
+        if attn is not None:
+            prompt_lens = attn.sum(dim=1).to(torch.long)  # [B]
+        else:
+            prompt_lens = (input_ids != pad_id).sum(dim=1).to(torch.long)
+
+        cont_lens = (cont != pad_id).sum(dim=1).to(torch.long)  # [B]
+
+        rows: list[list[int]] = []
+        max_len = 0
+        for i in range(B):
+            plen = int(prompt_lens[i].item())
+            clen = int(cont_lens[i].item())
+            p_tokens = input_ids[i, :plen].tolist()
+            c_tokens = cont[i, :clen].tolist() if clen > 0 else []
+            row = p_tokens + c_tokens
+            rows.append(row)
+            if len(row) > max_len:
+                max_len = len(row)
+
+        gen_tokens = torch.full((B, max_len), pad_id, dtype=input_ids.dtype, device=device)
+        attn_gen = torch.zeros((B, max_len), dtype=input_ids.dtype, device=device)
+        for i, row in enumerate(rows):
+            if len(row) > 0:
+                gen_tokens[i, : len(row)] = torch.tensor(row, dtype=input_ids.dtype, device=device)
+                attn_gen[i, : len(row)] = 1
+
+        return gen_tokens, attn_gen, prompt_lens
 
     # ------------------------ Step-wise history helpers ------------------------ #
     def _accumulate_for_step(self, ttl_loss_val: float, tent_loss_val: float, w_ttl_raw: float, w_tent_raw: float):
@@ -435,7 +491,7 @@ class TTLTENTTrainer(Seq2SeqTrainer):
         pad_id, eos_id = self._get_pad_eos_ids()
         fa = self.finetuning_args
         generation_len = int(getattr(fa, "generation_len", 0))
-        prompt_len = input_ids.size(1)  # P
+        prompt_max_len = input_ids.size(1)  # Pmax
 
         # 1) Generate continuation if needed
         if generation_len != 0:
@@ -450,8 +506,15 @@ class TTLTENTTrainer(Seq2SeqTrainer):
                         pad_id=pad_id,
                         device=device,
                         dtype=input_ids.dtype,
-                    )  # [B, Lc]
-                    generated_tokens = torch.cat([input_ids, cont], dim=1)  # [B, P+Lc]
+                    )  # [B, Cmax]
+
+                    # === 修正：将续写拼到每条样本真实 prompt 末尾（无 PAD 间隙），并构造 attention_mask_gen ===
+                    generated_tokens, attention_mask_gen, prompt_lens = self._concat_prompt_with_continuations(
+                        input_ids=input_ids,
+                        attn=attn,
+                        cont=cont,
+                        pad_id=pad_id,
+                    )  # [B, T], [B, T], [B]
                 else:
                     max_tokens = 2048 if generation_len == -1 else max(0, generation_len)
                     generated_tokens = self.model.generate(
@@ -464,31 +527,40 @@ class TTLTENTTrainer(Seq2SeqTrainer):
                         top_k=None,
                         top_p=None,
                         temperature=1.0,
-                    )  # [B, P+Lc*]
+                    )  # [B, T]
+                    # 续写后 attention_mask（不改变数值路径）
+                    attention_mask_gen = (generated_tokens != pad_id).to(input_ids.dtype)
+                    # 每条样本真实 prompt 长度
+                    if attn is not None:
+                        prompt_lens = attn.sum(dim=1).to(torch.long)
+                    else:
+                        prompt_lens = (input_ids != pad_id).sum(dim=1).to(torch.long)
+
             if was_train:
                 self.model.train()
-            tent_start = prompt_len
         else:
             # No generation: still do TENT on full input, but KL=0 by spec
             generated_tokens = input_ids
-            tent_start = 0  # indicates "no continuation"
+            attention_mask_gen = attn if attn is not None else (generated_tokens != pad_id).to(input_ids.dtype)
+            # 每条样本真实 prompt 长度
+            if attn is not None:
+                prompt_lens = attn.sum(dim=1).to(torch.long)
+            else:
+                prompt_lens = (input_ids != pad_id).sum(dim=1).to(torch.long)
 
-        # tok_start alignment: with continuation => P ; without => 1
-        tok_start = tent_start if tent_start > 0 else 1
-
-        # 2) One forward on (prompt+continuation)
-        outputs: CausalLMOutput = self.model(input_ids=generated_tokens)
+        # 2) One forward on (prompt+continuation) with explicit attention mask
+        outputs: CausalLMOutput = self.model(input_ids=generated_tokens, attention_mask=attention_mask_gen)
         logits = outputs.logits  # [B, T, V]
         B, T, V = logits.size()
 
-        # 3) TTL: sentence-level CE (prompt only)
-        if prompt_len > 1:
-            ttl_logits = logits[:, : prompt_len - 1, :]  # [B, P-1, V]
-            ttl_labels = generated_tokens[:, 1:prompt_len]  # [B, P-1]
+        # 3) TTL: sentence-level CE (prompt only, masked by original attn)
+        if prompt_max_len > 1:
+            ttl_logits = logits[:, : prompt_max_len - 1, :]  # [B, Pmax-1, V]
+            ttl_labels = generated_tokens[:, 1:prompt_max_len]  # [B, Pmax-1]
             criterion = CrossEntropyLoss(reduction="none", ignore_index=IGNORE_INDEX)
-            ttl_token_nll = criterion(ttl_logits.reshape(-1, V), ttl_labels.reshape(-1)).view(B, -1)  # [B, P-1]
+            ttl_token_nll = criterion(ttl_logits.reshape(-1, V), ttl_labels.reshape(-1)).view(B, -1)  # [B, Pmax-1]
             if attn is not None:
-                ttl_mask = (attn[:, 1:prompt_len] != 0).to(ttl_token_nll.dtype)  # [B, P-1]
+                ttl_mask = (attn[:, 1:prompt_max_len] != 0).to(ttl_token_nll.dtype)  # [B, Pmax-1]
             else:
                 ttl_mask = torch.ones_like(ttl_token_nll, dtype=ttl_token_nll.dtype)
             ttl_denom = ttl_mask.sum(dim=1).clamp_min(1.0)
@@ -499,21 +571,28 @@ class TTLTENTTrainer(Seq2SeqTrainer):
             ttl_mask = torch.zeros((B, 0), device=device, dtype=logits.dtype)
 
         # 4) TENT: entropy on continuation (or full input if no generation)
-        if tok_start <= T - 1:
-            gen_logits = logits[:, tok_start - 1 : T - 1, :]  # [B, Lg, V], Lg = T - tok_start
-            gen_tokens = generated_tokens[:, tok_start:]  # [B, Lg]
-            log_probs = F.log_softmax(gen_logits, dim=-1)
-            probs = log_probs.exp()
-            entropy_tok = -(probs * log_probs).sum(dim=-1)  # [B, Lg]
-            ent_mask = (gen_tokens != pad_id) & (gen_tokens != eos_id)
-            ent_mask = ent_mask.to(entropy_tok.dtype)
+        # 统一在全时刻上计算 log_probs / entropy，再用 mask 选择续写段（更易与可变 prompt 对齐）
+        if T >= 2:
+            all_logits_next = logits[:, :-1, :]  # [B, T-1, V] -> 对应预测 generated_tokens[:, 1:]
+            all_tokens_next = generated_tokens[:, 1:]  # [B, T-1]
+            log_probs_all = F.log_softmax(all_logits_next, dim=-1)  # [B, T-1, V]
+            probs_all = log_probs_all.exp()
+            entropy_tok = -(probs_all * log_probs_all).sum(dim=-1)  # [B, T-1]
+
+            # 续写段掩码：位置 j 对应预测 token 索引 (j+1)，续写从索引 >= prompt_lens[i]
+            idx = torch.arange(T - 1, device=device).unsqueeze(0).expand(B, -1)  # [B, T-1]
+            cont_mask = idx >= prompt_lens.unsqueeze(1)  # [B, T-1] (bool)
+            tok_mask = (all_tokens_next != pad_id) & (all_tokens_next != eos_id)  # [B, T-1] (bool)
+            final_mask = (cont_mask & tok_mask).to(entropy_tok.dtype)  # [B, T-1]
+
             # mean entropy per sequence (original TENT)
-            tent_seq_entropy = (entropy_tok * ent_mask).sum(dim=1) / ent_mask.sum(dim=1).clamp_min(1e-8)  # [B]
+            tent_seq_entropy = (entropy_tok * final_mask).sum(dim=1) / final_mask.sum(dim=1).clamp_min(1e-8)  # [B]
             # EM-FT: path-total entropy per sequence (sum over tokens)
-            tent_seq_total_entropy = (entropy_tok * ent_mask).sum(dim=1)  # [B]
+            tent_seq_total_entropy = (entropy_tok * final_mask).sum(dim=1)  # [B]
         else:
+            log_probs_all = torch.zeros((B, 0, V), device=device, dtype=logits.dtype)
             entropy_tok = torch.zeros((B, 0), device=device, dtype=logits.dtype)
-            ent_mask = torch.zeros((B, 0), device=device, dtype=logits.dtype)
+            final_mask = torch.zeros((B, 0), device=device, dtype=logits.dtype)
             tent_seq_entropy = torch.zeros((B,), device=device, dtype=logits.dtype)
             tent_seq_total_entropy = torch.zeros((B,), device=device, dtype=logits.dtype)
 
@@ -566,7 +645,7 @@ class TTLTENTTrainer(Seq2SeqTrainer):
         ttl_selected_ratio = (
             float((ce_ref > threshold).float().mean().item()) if (apply_ttl_gate or apply_tent_gate) else 1.0
         )
-        tent_valid_ratio = float(ent_mask.mean().item()) if ent_mask.numel() > 0 else 1.0
+        tent_valid_ratio = float(final_mask.mean().item()) if final_mask.numel() > 0 else 1.0
         context = {"ttl_selected_ratio": ttl_selected_ratio, "tent_valid_ratio": tent_valid_ratio}
 
         w_ttl_raw, w_tent_raw, extra_loss = self._balancer.compute_weights(
@@ -586,33 +665,63 @@ class TTLTENTTrainer(Seq2SeqTrainer):
 
         # 9) reverse-KL(student‖teacher) on continuation only
         kl_loss = logits.new_zeros(())
-        if generation_len != 0 and self.teacher is not None and tok_start <= T - 1:
-            # Build valid positions mask for continuation
-            targets = generated_tokens[:, tok_start:T]  # [B, Lg]
-            kl_mask = (targets != pad_id) & (targets != eos_id)  # [B, Lg]
-            flat_mask = kl_mask.reshape(-1)
+        if generation_len != 0 and T >= 2:
+            # KL 只作用在续写段有效 token 上（非 PAD 非 EOS）
+            kl_mask_bool = final_mask > 0  # [B, T-1]
+            flat_mask = kl_mask_bool.reshape(-1)
             valid_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)  # [N_valid]
             if valid_idx.numel() > 0:
-                # student logits slice
-                s_logits = logits[:, tok_start - 1 : T - 1, :].reshape(-1, V).index_select(0, valid_idx)  # [N, V]
-                # teacher forward (no grad, allow AMP)
+                # === 学生端：复用已计算的 log_probs（2.1 优化） ===
+                logp_s_flat = log_probs_all.reshape(-1, V)  # [B*(T-1), V]
+                logp_s = logp_s_flat.index_select(0, valid_idx)  # [N, V]
+                p_s = logp_s.exp()
+
+                # === 教师端：优先使用 LoRA 的 disable_adapter()，否则回退到 self.teacher ===
+                # 统一使用 inference_mode()；支持 AMP
                 use_amp = bool(getattr(self.args, "fp16", False) or getattr(self.args, "bf16", False))
-                with torch.no_grad():
+                unwrapped = getattr(self.accelerator, "unwrap_model", lambda x: x)(self.model)
+                base_ctx_fn = getattr(unwrapped, "disable_adapter", None)
+                base_ctx = base_ctx_fn() if base_ctx_fn is not None else _nullctx()
+
+                with torch.inference_mode():
                     if use_amp and torch.cuda.is_available():
                         amp_dtype = torch.float16 if getattr(self.args, "fp16", False) else torch.bfloat16
                         with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                            t_logits_all = self.teacher(input_ids=generated_tokens).logits  # [B, T, V]
+                            if base_ctx_fn is not None:
+                                with base_ctx:
+                                    t_logits_all = self.model(
+                                        input_ids=generated_tokens, attention_mask=attention_mask_gen
+                                    ).logits  # [B, T, V]
+                            elif self.teacher is not None:
+                                t_logits_all = self.teacher(
+                                    input_ids=generated_tokens, attention_mask=attention_mask_gen
+                                ).logits
+                            else:
+                                # 极端兜底：无 disable_adapter 也无 teacher，则跳过 KL
+                                t_logits_all = None
                     else:
-                        t_logits_all = self.teacher(input_ids=generated_tokens).logits
-                t_logits = (
-                    t_logits_all[:, tok_start - 1 : T - 1, :].reshape(-1, V).index_select(0, valid_idx)
-                )  # [N, V]
+                        if base_ctx_fn is not None:
+                            with base_ctx:
+                                t_logits_all = self.model(
+                                    input_ids=generated_tokens, attention_mask=attention_mask_gen
+                                ).logits
+                        elif self.teacher is not None:
+                            t_logits_all = self.teacher(
+                                input_ids=generated_tokens, attention_mask=attention_mask_gen
+                            ).logits
+                        else:
+                            t_logits_all = None
 
-                logp_s = torch.log_softmax(s_logits, dim=-1)  # [N, V]
-                logq_t = torch.log_softmax(t_logits, dim=-1)  # [N, V]
-                p_s = logp_s.exp()
-                kl_tok = (p_s * (logp_s - logq_t)).sum(dim=-1)  # [N]
-                kl_loss = kl_tok.mean()  # seq-mean（token-mean同向，仅数值缩放差异）
+                if t_logits_all is not None:
+                    t_logits_t1 = t_logits_all[:, :-1, :].reshape(-1, V)  # [B*(T-1), V]
+                    t_logits = t_logits_t1.index_select(0, valid_idx)  # [N, V]
+                    # 及时释放大张量（1.1）
+                    del t_logits_all
+                    del t_logits_t1
+
+                    logq_t = torch.log_softmax(t_logits, dim=-1)  # [N, V]
+                    kl_tok = (p_s * (logp_s - logq_t)).sum(dim=-1)  # [N]
+                    kl_loss = kl_tok.mean()
 
         kl_weight = float(getattr(fa, "kl_weight", 0.0))
         total_loss = (ttl_loss * w_ttl_eff) + (tent_loss * w_tent_eff) + (kl_weight * kl_loss) + extra_loss
@@ -620,7 +729,7 @@ class TTLTENTTrainer(Seq2SeqTrainer):
         # 10) record history for plots (use raw per-branch losses and raw balancer weights)
         self._accumulate_for_step(ttl_loss.detach().item(), tent_loss.detach().item(), w_ttl_raw, w_tent_raw)
 
-        # 11) token-level diagnostics (prompt NLL & generation entropy)
+        # 11) token-level diagnostics
         try:
             with torch.no_grad():
                 ex_ids = inputs.get("example_id", None)
@@ -632,46 +741,41 @@ class TTLTENTTrainer(Seq2SeqTrainer):
                 prompt_ids_list, gen_ids_list = [], []
                 prompt_nll_list, gen_entropy_list = [], []
 
+                # y 对应 generated_tokens 的 [1:]，与 log_probs_all / entropy_tok 对齐
+                y_tokens = generated_tokens[:, 1:]  # [B, T-1]
+
                 for i in range(B):
-                    # prompt tokens (truncate by attention if provided)
+                    # prompt tokens（按原 attn 截断）
                     if attn is not None:
                         plen = int(attn[i].sum().item())
                     else:
-                        plen = int(prompt_len)
+                        plen = int(prompt_max_len)
                     prompt_ids = input_ids[i, :plen].detach().cpu().tolist()
                     prompt_ids_list.append(prompt_ids)
 
-                    # generation tokens (tok_start)
-                    if T >= tok_start + 1:
-                        gen_ids = generated_tokens[i, tok_start:].detach().cpu()
-                        gen_mask_i = (
-                            ent_mask[i].bool().detach().cpu()
-                            if ent_mask.numel() > 0
-                            else torch.tensor([], dtype=torch.bool)
-                        )
-                        gen_ids = (
-                            gen_ids[gen_mask_i]
-                            if gen_mask_i.numel() > 0
-                            else torch.tensor([], dtype=generated_tokens.dtype)
-                        )
-                        gen_ids_list.append(gen_ids.tolist())
+                    # generation tokens（依据 final_mask）
+                    if (T - 1) > 0:
+                        mask_i = (final_mask[i] > 0).bool().detach().cpu()
+                        gen_ids_i = y_tokens[i].detach().cpu()
+                        gen_ids_i = gen_ids_i[mask_i] if mask_i.numel() > 0 else torch.tensor([], dtype=y_tokens.dtype)
+                        gen_ids_list.append(gen_ids_i.tolist())
                     else:
                         gen_ids_list.append([])
 
                     # prompt token-level NLL
                     if ttl_token_nll.size(1) > 0:
-                        mask_i = ttl_mask[i].bool().detach().cpu()
+                        mask_pi = ttl_mask[i].bool().detach().cpu()
                         nll_i = ttl_token_nll[i].detach().cpu()
-                        nll_i = nll_i[mask_i] if mask_i.numel() > 0 else torch.tensor([])
+                        nll_i = nll_i[mask_pi] if mask_pi.numel() > 0 else torch.tensor([])
                         prompt_nll_list.append([float(x) for x in nll_i.tolist()])
                     else:
                         prompt_nll_list.append([])
 
                     # generation token-level entropy
                     if entropy_tok.size(1) > 0:
-                        e_mask_i = ent_mask[i].bool().detach().cpu()
+                        mask_gi = (final_mask[i] > 0).bool().detach().cpu()
                         ent_i = entropy_tok[i].detach().cpu()
-                        ent_i = ent_i[e_mask_i] if e_mask_i.numel() > 0 else torch.tensor([])
+                        ent_i = ent_i[mask_gi] if mask_gi.numel() > 0 else torch.tensor([])
                         gen_entropy_list.append([float(x) for x in ent_i.tolist()])
                     else:
                         gen_entropy_list.append([])
