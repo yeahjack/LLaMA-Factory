@@ -218,29 +218,36 @@ class TTLTENTTrainer(Seq2SeqTrainer):
             except Exception as e:
                 logger.warning_rank0(f"Could not set padding_side: {e}")
 
-        # === 教师构造策略：优先 disable_adapter，避免 deepcopy 造成显存浪费 ===
-        try:
-            unwrapped = getattr(self.accelerator, "unwrap_model", lambda x: x)(self.model)
-            has_disable = getattr(unwrapped, "disable_adapter", None) is not None
-        except Exception:
-            unwrapped = self.model
-            has_disable = False
-
-        if has_disable:
-            # 使用 LoRA 的 disable_adapter() 作为教师路径；不创建 teacher 副本
-            self.teacher: nn.Module | None = None
-            logger.info_rank0("[TTLTENT] Using disable_adapter() for teacher path. No deepcopy allocated.")
-        else:
-            # 回退：深拷贝一份冻结教师
+        # === 教师构造策略：仅在 use_kl_regularization 为 True 且存在续写时才尝试构造 ===
+        if bool(getattr(self.finetuning_args, "use_kl_regularization", False)) and int(
+            getattr(self.finetuning_args, "generation_len", 0)
+        ) != 0:
             try:
-                self.teacher = copy.deepcopy(self.model)
-                for p in self.teacher.parameters():
-                    p.requires_grad_(False)
-                self.teacher.eval()
-                logger.info_rank0("[TTLTENT] Teacher model created via deepcopy (fallback).")
-            except Exception as e:
-                logger.warning_rank0(f"Failed to copy teacher model (KL may be disabled): {e}")
-                self.teacher = None
+                unwrapped = getattr(self.accelerator, "unwrap_model", lambda x: x)(self.model)
+                has_disable = getattr(unwrapped, "disable_adapter", None) is not None
+            except Exception:
+                unwrapped = self.model
+                has_disable = False
+
+            if has_disable:
+                # 使用 LoRA 的 disable_adapter() 作为教师路径；不创建 teacher 副本
+                self.teacher: nn.Module | None = None
+                logger.info_rank0("[TTLTENT] Using disable_adapter() for teacher path. No deepcopy allocated.")
+            else:
+                # 回退：深拷贝一份冻结教师
+                try:
+                    self.teacher = copy.deepcopy(self.model)
+                    for p in self.teacher.parameters():
+                        p.requires_grad_(False)
+                    self.teacher.eval()
+                    logger.info_rank0("[TTLTENT] Teacher model created via deepcopy (fallback).")
+                except Exception as e:
+                    logger.warning_rank0(f"Failed to copy teacher model (KL may be disabled): {e}")
+                    self.teacher = None
+        else:
+            # KL 关闭或无续写：不构造 teacher，不使用 disable_adapter 路径
+            self.teacher = None
+            logger.info_rank0("[TTLTENT] KL disabled or no generation: no teacher/disable_adapter will be used.")
 
         # Balancer
         base_balancer = _build_balancer(self.finetuning_args)
@@ -452,7 +459,7 @@ class TTLTENTTrainer(Seq2SeqTrainer):
             plt.ylabel("tent_entropy_loss")
             plt.title("TENT entropy loss vs step")
             plt.legend()
-            tent_path = os.path.join(out_dir, "tent_entropy_loss.png")
+            tent_path = os.path.join(out_dir, "tent_entropy.png")
             plt.savefig(tent_path, bbox_inches="tight")
             plt.close()
 
@@ -508,7 +515,7 @@ class TTLTENTTrainer(Seq2SeqTrainer):
                         dtype=input_ids.dtype,
                     )  # [B, Cmax]
 
-                    # === 修正：将续写拼到每条样本真实 prompt 末尾（无 PAD 间隙），并构造 attention_mask_gen ===
+                    # 将续写拼到每条样本真实 prompt 末尾（无 PAD 间隙），并构造 attention_mask_gen
                     generated_tokens, attention_mask_gen, prompt_lens = self._concat_prompt_with_continuations(
                         input_ids=input_ids,
                         attn=attn,
@@ -665,19 +672,18 @@ class TTLTENTTrainer(Seq2SeqTrainer):
 
         # 9) reverse-KL(student‖teacher) on continuation only
         kl_loss = logits.new_zeros(())
-        if generation_len != 0 and T >= 2:
+        if bool(getattr(fa, "use_kl_regularization", False)) and generation_len != 0 and T >= 2:
             # KL 只作用在续写段有效 token 上（非 PAD 非 EOS）
             kl_mask_bool = final_mask > 0  # [B, T-1]
             flat_mask = kl_mask_bool.reshape(-1)
             valid_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)  # [N_valid]
             if valid_idx.numel() > 0:
-                # === 学生端：复用已计算的 log_probs（2.1 优化） ===
+                # 学生端：复用已计算的 log_probs
                 logp_s_flat = log_probs_all.reshape(-1, V)  # [B*(T-1), V]
                 logp_s = logp_s_flat.index_select(0, valid_idx)  # [N, V]
                 p_s = logp_s.exp()
 
-                # === 教师端：优先使用 LoRA 的 disable_adapter()，否则回退到 self.teacher ===
-                # 统一使用 inference_mode()；支持 AMP
+                # 教师端：优先 disable_adapter()，否则回退到 self.teacher
                 use_amp = bool(getattr(self.args, "fp16", False) or getattr(self.args, "bf16", False))
                 unwrapped = getattr(self.accelerator, "unwrap_model", lambda x: x)(self.model)
                 base_ctx_fn = getattr(unwrapped, "disable_adapter", None)
@@ -697,7 +703,6 @@ class TTLTENTTrainer(Seq2SeqTrainer):
                                     input_ids=generated_tokens, attention_mask=attention_mask_gen
                                 ).logits
                             else:
-                                # 极端兜底：无 disable_adapter 也无 teacher，则跳过 KL
                                 t_logits_all = None
                     else:
                         if base_ctx_fn is not None:
@@ -715,7 +720,7 @@ class TTLTENTTrainer(Seq2SeqTrainer):
                 if t_logits_all is not None:
                     t_logits_t1 = t_logits_all[:, :-1, :].reshape(-1, V)  # [B*(T-1), V]
                     t_logits = t_logits_t1.index_select(0, valid_idx)  # [N, V]
-                    # 及时释放大张量（1.1）
+                    # 及时释放大张量
                     del t_logits_all
                     del t_logits_t1
 
@@ -723,7 +728,8 @@ class TTLTENTTrainer(Seq2SeqTrainer):
                     kl_tok = (p_s * (logp_s - logq_t)).sum(dim=-1)  # [N]
                     kl_loss = kl_tok.mean()
 
-        kl_weight = float(getattr(fa, "kl_weight", 0.0))
+        # KL 不进入 balancer；若未启用则权重强制为 0
+        kl_weight = float(getattr(fa, "kl_weight", 0.0)) if bool(getattr(fa, "use_kl_regularization", False)) else 0.0
         total_loss = (ttl_loss * w_ttl_eff) + (tent_loss * w_tent_eff) + (kl_weight * kl_loss) + extra_loss
 
         # 10) record history for plots (use raw per-branch losses and raw balancer weights)

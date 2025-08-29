@@ -62,7 +62,7 @@ TTL_REF_MODE_LIST=(
   "precompute" 
   #"simultaneous"
 )
-TTL_REF_BATCH_SIZE_LIST=(1)
+TTL_REF_BATCH_SIZE_LIST=(4)
 TTL_ENABLE_INFERENCE_LIST=("false")
 TTL_THRESHOLD_LIST=(3)
 TTL_SCALER_LIST=(0.1)
@@ -74,9 +74,9 @@ methods=(
   # "ttlu"
   # "ttl"
   # "tent"
-  "eata"
-  "eata_sdiv"
-  # "ttltent"
+  # "eata"
+  # "eata_sdiv"
+  "ttltent"
   # "sft"
 )
 
@@ -85,10 +85,10 @@ generation_lens=(
   # 1
   4
   # 8
-  16
+  # 16
   # 32
-  64
-  -1
+  # 64
+  # -1
   # 80
 )
 
@@ -175,7 +175,7 @@ EATA_SELECT_HIGH_ENTROPY_LIST=(
 )  # 仅对 eata/eata_sdiv 生效
 USE_EMFT_LOSS_LIST=(
   "true"
-  #"false"
+  "false"
 )  # 对 ttl/ttlu 无效（见下方过滤与注入逻辑）
 # 生成模型模式（适用于名字包含 "tent"/"eata" 的方法）："simultaneous" 或 "precompute"
 GEN_MODEL_LIST=("precompute")
