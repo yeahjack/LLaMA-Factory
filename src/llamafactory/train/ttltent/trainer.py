@@ -38,6 +38,21 @@ logger = get_logger(__name__)
 
 
 # ============================================================
+# JIT优化的核心计算函数（仅加速，不改变逻辑）
+# ============================================================
+
+
+@torch.jit.script
+def _compute_kl_fast(
+    student_logprobs: torch.Tensor,  # [N, V]
+    teacher_logits: torch.Tensor,  # [N, V]
+) -> torch.Tensor:
+    """JIT优化的KL散度计算，与原逻辑完全等价。"""
+    teacher_logprobs = F.log_softmax(teacher_logits, dim=-1)
+    return torch.sum(torch.exp(student_logprobs) * (student_logprobs - teacher_logprobs), dim=-1)
+
+
+# ============================================================
 # Loss Balancer Framework
 # ============================================================
 
@@ -207,8 +222,27 @@ class TTLTENTTrainer(Seq2SeqTrainer):
         self.ref_sentence_ce: dict[int, float] | None = None
         self._precompute_ptr: int = 0
 
-        # token-level diagnostic log
+        # token-level diagnostic log - 保持默认开启
         self.token_log: list[dict] = []
+        self._enable_token_diagnostics = bool(getattr(finetuning_args, "enable_token_diagnostics", True))
+
+        # 配置预计算优化：缓存常用配置参数避免重复getattr调用
+        self._generation_len = int(getattr(finetuning_args, "generation_len", 0))
+        self._use_kl_regularization = bool(getattr(finetuning_args, "use_kl_regularization", False))
+        self._kl_weight = float(getattr(finetuning_args, "kl_weight", 0.0))
+        self._use_emft_loss = bool(getattr(finetuning_args, "use_emft_loss", False))
+        self._ttl_ref_mode = str(getattr(finetuning_args, "ttl_ref_mode", "precompute")).lower()
+        self._ttl_gating = str(getattr(finetuning_args, "ttl_gating", "ttl")).lower()
+        self._ttl_threshold = float(getattr(finetuning_args, "ttl_threshold", 3.0))
+        self._ttl_scaler = float(getattr(finetuning_args, "ttl_sample_efficiency_scaler", 0.1))
+        self._loss_weight_ttl = float(getattr(finetuning_args, "loss_weight_ttl", 1.0))
+        self._loss_weight_tent = float(getattr(finetuning_args, "loss_weight_tent", 1.0))
+        self._alternating_training = bool(getattr(finetuning_args, "alternating_training", False))
+
+        # 预计算gating条件
+        self._apply_ttl_gate = self._ttl_gating in {"ttl", "all"}
+        self._apply_tent_gate = self._ttl_gating in {"tent", "all"}
+        self._use_kl = self._use_kl_regularization and self._generation_len != 0
 
         # Padding side hint
         if hasattr(self, "processing_class") and self.processing_class is not None:
@@ -218,10 +252,8 @@ class TTLTENTTrainer(Seq2SeqTrainer):
             except Exception as e:
                 logger.warning_rank0(f"Could not set padding_side: {e}")
 
-        # === 教师构造策略：仅在 use_kl_regularization 为 True 且存在续写时才尝试构造 ===
-        if bool(getattr(self.finetuning_args, "use_kl_regularization", False)) and int(
-            getattr(self.finetuning_args, "generation_len", 0)
-        ) != 0:
+        # === 教师构造策略：仅在需要KL时才尝试构造 ===
+        if self._use_kl:
             try:
                 unwrapped = getattr(self.accelerator, "unwrap_model", lambda x: x)(self.model)
                 has_disable = getattr(unwrapped, "disable_adapter", None) is not None
@@ -496,17 +528,15 @@ class TTLTENTTrainer(Seq2SeqTrainer):
         attn: torch.Tensor | None = inputs.get("attention_mask", None)  # [B, P] or None
         device = input_ids.device
         pad_id, eos_id = self._get_pad_eos_ids()
-        fa = self.finetuning_args
-        generation_len = int(getattr(fa, "generation_len", 0))
         prompt_max_len = input_ids.size(1)  # Pmax
 
-        # 1) Generate continuation if needed
-        if generation_len != 0:
+        # 1) Generate continuation if needed - 使用预计算的配置
+        if self._generation_len != 0:
             was_train = self.model.training
             self.model.eval()
             with torch.no_grad():
                 if self.gen_model_mode == "precompute" and self.precomputed_predictions is not None:
-                    limit = None if generation_len == -1 else max(0, generation_len)
+                    limit = None if self._generation_len == -1 else max(0, self._generation_len)
                     cont = self._fetch_precomputed_continuations(
                         bsz=input_ids.size(0),
                         limit=limit,
@@ -523,7 +553,7 @@ class TTLTENTTrainer(Seq2SeqTrainer):
                         pad_id=pad_id,
                     )  # [B, T], [B, T], [B]
                 else:
-                    max_tokens = 2048 if generation_len == -1 else max(0, generation_len)
+                    max_tokens = 2048 if self._generation_len == -1 else max(0, self._generation_len)
                     generated_tokens = self.model.generate(
                         input_ids=input_ids,
                         attention_mask=attn,
@@ -604,10 +634,7 @@ class TTLTENTTrainer(Seq2SeqTrainer):
             tent_seq_total_entropy = torch.zeros((B,), device=device, dtype=logits.dtype)
 
         # 5) Reference CE for gating
-        ref_mode = str(getattr(fa, "ttl_ref_mode", "precompute")).lower()
-        if ref_mode not in {"precompute", "simultaneous"}:
-            raise ValueError(f"Unsupported ttl_ref_mode: {ref_mode}")
-        if ref_mode == "simultaneous":
+        if self._ttl_ref_mode == "simultaneous":
             ce_ref = sentence_ce_train.detach()
         else:
             if "example_id" not in inputs:
@@ -619,50 +646,42 @@ class TTLTENTTrainer(Seq2SeqTrainer):
                 ex_ids = ex_ids.tolist()
             ce_ref = torch.tensor([self.ref_sentence_ce[int(e)] for e in ex_ids], dtype=logits.dtype, device=device)
 
-        # 6) TTL gating & loss
-        ttl_gating: str = str(getattr(fa, "ttl_gating", "ttl")).lower()
-        threshold = float(getattr(fa, "ttl_threshold", 3.0))
-        scaler = float(getattr(fa, "ttl_sample_efficiency_scaler", 0.1))
-        apply_ttl_gate = ttl_gating in {"ttl", "all"}
-        apply_tent_gate = ttl_gating in {"tent", "all"}
-
-        if apply_ttl_gate:
-            delta = (ce_ref - threshold).clamp_max(20.0)
-            mask_s = (ce_ref > threshold).to(logits.dtype)
-            coeff = scaler * torch.exp(delta.detach())
+        # 6) TTL gating & loss - 使用预计算的配置
+        if self._apply_ttl_gate:
+            delta = (ce_ref - self._ttl_threshold).clamp_max(20.0)
+            mask_s = (ce_ref > self._ttl_threshold).to(logits.dtype)
+            coeff = self._ttl_scaler * torch.exp(delta.detach())
             ttl_vec = sentence_ce_train * coeff * mask_s
             ttl_loss = (ttl_vec.sum() / mask_s.sum().clamp_min(1.0)) if mask_s.sum() != 0 else sentence_ce_train.mean()
         else:
             ttl_loss = sentence_ce_train.mean()
 
-        # 7) TENT gating & loss（支持 EM-FT；样本级 gating）
-        use_emft = bool(getattr(fa, "use_emft_loss", False))
-        tent_base_vec = tent_seq_total_entropy if use_emft else tent_seq_entropy  # [B]
+        # 7) TENT gating & loss（支持 EM-FT；样本级 gating）- 使用预计算的配置
+        tent_base_vec = tent_seq_total_entropy if self._use_emft_loss else tent_seq_entropy  # [B]
 
-        if apply_tent_gate:
-            mask_s = (ce_ref > threshold).to(logits.dtype)
+        if self._apply_tent_gate:
+            mask_s = (ce_ref > self._ttl_threshold).to(logits.dtype)
             tent_vec = tent_base_vec * mask_s  # [B]
             tent_loss = (tent_vec.sum() / mask_s.sum().clamp_min(1.0)) if mask_s.sum() != 0 else tent_base_vec.mean()
         else:
             tent_loss = tent_base_vec.mean()
 
-        # 8) Balancer (raw weights) then alternating (effective)
-        base_w_ttl = float(getattr(fa, "loss_weight_ttl", 1.0))
-        base_w_tent = float(getattr(fa, "loss_weight_tent", 1.0))
+        # 8) Balancer (raw weights) then alternating (effective) - 使用预计算的配置
         ttl_selected_ratio = (
-            float((ce_ref > threshold).float().mean().item()) if (apply_ttl_gate or apply_tent_gate) else 1.0
+            float((ce_ref > self._ttl_threshold).float().mean().item())
+            if (self._apply_ttl_gate or self._apply_tent_gate)
+            else 1.0
         )
         tent_valid_ratio = float(final_mask.mean().item()) if final_mask.numel() > 0 else 1.0
         context = {"ttl_selected_ratio": ttl_selected_ratio, "tent_valid_ratio": tent_valid_ratio}
 
         w_ttl_raw, w_tent_raw, extra_loss = self._balancer.compute_weights(
-            self, base_w_ttl, base_w_tent, ttl_loss, tent_loss, context
+            self, self._loss_weight_ttl, self._loss_weight_tent, ttl_loss, tent_loss, context
         )
 
-        alternating = bool(getattr(fa, "alternating_training", False))
         ttl_active = True
         tent_active = True
-        if alternating:
+        if self._alternating_training:
             step_idx = (self.state.global_step or 0) + 1
             ttl_active = step_idx % 2 == 1
             tent_active = not ttl_active
@@ -670,18 +689,16 @@ class TTLTENTTrainer(Seq2SeqTrainer):
         w_ttl_eff = w_ttl_raw if ttl_active else 0.0
         w_tent_eff = w_tent_raw if tent_active else 0.0
 
-        # 9) reverse-KL(student‖teacher) on continuation only
+        # 9) reverse-KL(student‖teacher) on continuation only - 使用Boolean mask优化
         kl_loss = logits.new_zeros(())
-        if bool(getattr(fa, "use_kl_regularization", False)) and generation_len != 0 and T >= 2:
+        if self._use_kl and T >= 2:
             # KL 只作用在续写段有效 token 上（非 PAD 非 EOS）
             kl_mask_bool = final_mask > 0  # [B, T-1]
-            flat_mask = kl_mask_bool.reshape(-1)
-            valid_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)  # [N_valid]
-            if valid_idx.numel() > 0:
-                # 学生端：复用已计算的 log_probs
-                logp_s_flat = log_probs_all.reshape(-1, V)  # [B*(T-1), V]
-                logp_s = logp_s_flat.index_select(0, valid_idx)  # [N, V]
-                p_s = logp_s.exp()
+
+            if kl_mask_bool.any():
+                # 学生端：复用已计算的 log_probs，使用Boolean mask优化
+                student_logits_masked = all_logits_next[kl_mask_bool]  # [N_valid, V]
+                student_logprobs_masked = F.log_softmax(student_logits_masked, dim=-1)
 
                 # 教师端：优先 disable_adapter()，否则回退到 self.teacher
                 use_amp = bool(getattr(self.args, "fp16", False) or getattr(self.args, "bf16", False))
@@ -718,85 +735,86 @@ class TTLTENTTrainer(Seq2SeqTrainer):
                             t_logits_all = None
 
                 if t_logits_all is not None:
-                    t_logits_t1 = t_logits_all[:, :-1, :].reshape(-1, V)  # [B*(T-1), V]
-                    t_logits = t_logits_t1.index_select(0, valid_idx)  # [N, V]
-                    # 及时释放大张量
-                    del t_logits_all
-                    del t_logits_t1
+                    # Boolean mask优化：直接使用mask索引，避免reshape+nonzero+index_select
+                    teacher_logits_next = t_logits_all[:, :-1, :]  # [B, T-1, V]
+                    teacher_logits_masked = teacher_logits_next[kl_mask_bool]  # [N_valid, V]
 
-                    logq_t = torch.log_softmax(t_logits, dim=-1)  # [N, V]
-                    kl_tok = (p_s * (logp_s - logq_t)).sum(dim=-1)  # [N]
+                    # 使用JIT优化的KL计算，与原逻辑等价
+                    kl_tok = _compute_kl_fast(student_logprobs_masked, teacher_logits_masked)
                     kl_loss = kl_tok.mean()
 
-        # KL 不进入 balancer；若未启用则权重强制为 0
-        kl_weight = float(getattr(fa, "kl_weight", 0.0)) if bool(getattr(fa, "use_kl_regularization", False)) else 0.0
-        total_loss = (ttl_loss * w_ttl_eff) + (tent_loss * w_tent_eff) + (kl_weight * kl_loss) + extra_loss
+        # KL权重处理 - 使用预计算的配置
+        kl_weight_eff = self._kl_weight if self._use_kl else 0.0
+        total_loss = (ttl_loss * w_ttl_eff) + (tent_loss * w_tent_eff) + (kl_weight_eff * kl_loss) + extra_loss
 
         # 10) record history for plots (use raw per-branch losses and raw balancer weights)
         self._accumulate_for_step(ttl_loss.detach().item(), tent_loss.detach().item(), w_ttl_raw, w_tent_raw)
 
         # 11) token-level diagnostics
-        try:
-            with torch.no_grad():
-                ex_ids = inputs.get("example_id", None)
-                if isinstance(ex_ids, torch.Tensor):
-                    ex_ids = ex_ids.detach().cpu().tolist()
-                else:
-                    ex_ids = [-1] * B
-
-                prompt_ids_list, gen_ids_list = [], []
-                prompt_nll_list, gen_entropy_list = [], []
-
-                # y 对应 generated_tokens 的 [1:]，与 log_probs_all / entropy_tok 对齐
-                y_tokens = generated_tokens[:, 1:]  # [B, T-1]
-
-                for i in range(B):
-                    # prompt tokens（按原 attn 截断）
-                    if attn is not None:
-                        plen = int(attn[i].sum().item())
+        if self._enable_token_diagnostics:
+            try:
+                with torch.no_grad():
+                    ex_ids = inputs.get("example_id", None)
+                    if isinstance(ex_ids, torch.Tensor):
+                        ex_ids = ex_ids.detach().cpu().tolist()
                     else:
-                        plen = int(prompt_max_len)
-                    prompt_ids = input_ids[i, :plen].detach().cpu().tolist()
-                    prompt_ids_list.append(prompt_ids)
+                        ex_ids = [-1] * B
 
-                    # generation tokens（依据 final_mask）
-                    if (T - 1) > 0:
-                        mask_i = (final_mask[i] > 0).bool().detach().cpu()
-                        gen_ids_i = y_tokens[i].detach().cpu()
-                        gen_ids_i = gen_ids_i[mask_i] if mask_i.numel() > 0 else torch.tensor([], dtype=y_tokens.dtype)
-                        gen_ids_list.append(gen_ids_i.tolist())
-                    else:
-                        gen_ids_list.append([])
+                    prompt_ids_list, gen_ids_list = [], []
+                    prompt_nll_list, gen_entropy_list = [], []
 
-                    # prompt token-level NLL
-                    if ttl_token_nll.size(1) > 0:
-                        mask_pi = ttl_mask[i].bool().detach().cpu()
-                        nll_i = ttl_token_nll[i].detach().cpu()
-                        nll_i = nll_i[mask_pi] if mask_pi.numel() > 0 else torch.tensor([])
-                        prompt_nll_list.append([float(x) for x in nll_i.tolist()])
-                    else:
-                        prompt_nll_list.append([])
+                    # y 对应 generated_tokens 的 [1:]，与 log_probs_all / entropy_tok 对齐
+                    y_tokens = generated_tokens[:, 1:]  # [B, T-1]
 
-                    # generation token-level entropy
-                    if entropy_tok.size(1) > 0:
-                        mask_gi = (final_mask[i] > 0).bool().detach().cpu()
-                        ent_i = entropy_tok[i].detach().cpu()
-                        ent_i = ent_i[mask_gi] if mask_gi.numel() > 0 else torch.tensor([])
-                        gen_entropy_list.append([float(x) for x in ent_i.tolist()])
-                    else:
-                        gen_entropy_list.append([])
+                    for i in range(B):
+                        # prompt tokens（按原 attn 截断）
+                        if attn is not None:
+                            plen = int(attn[i].sum().item())
+                        else:
+                            plen = int(prompt_max_len)
+                        prompt_ids = input_ids[i, :plen].detach().cpu().tolist()
+                        prompt_ids_list.append(prompt_ids)
 
-                for i in range(B):
-                    self.token_log.append(
-                        {
-                            "example_id": int(ex_ids[i]) if ex_ids else -1,
-                            "prompt_token_ids": prompt_ids_list[i],
-                            "generated_token_ids": gen_ids_list[i],
-                            "prompt_token_nll": prompt_nll_list[i],
-                            "generation_token_entropy": gen_entropy_list[i],
-                        }
-                    )
-        except Exception as e:
-            logger.warning_rank0(f"[TTLTENT] token_log append failed: {e}")
+                        # generation tokens（依据 final_mask）
+                        if (T - 1) > 0:
+                            mask_i = (final_mask[i] > 0).bool().detach().cpu()
+                            gen_ids_i = y_tokens[i].detach().cpu()
+                            gen_ids_i = (
+                                gen_ids_i[mask_i] if mask_i.numel() > 0 else torch.tensor([], dtype=y_tokens.dtype)
+                            )
+                            gen_ids_list.append(gen_ids_i.tolist())
+                        else:
+                            gen_ids_list.append([])
+
+                        # prompt token-level NLL
+                        if ttl_token_nll.size(1) > 0:
+                            mask_pi = ttl_mask[i].bool().detach().cpu()
+                            nll_i = ttl_token_nll[i].detach().cpu()
+                            nll_i = nll_i[mask_pi] if mask_pi.numel() > 0 else torch.tensor([])
+                            prompt_nll_list.append([float(x) for x in nll_i.tolist()])
+                        else:
+                            prompt_nll_list.append([])
+
+                        # generation token-level entropy
+                        if entropy_tok.size(1) > 0:
+                            mask_gi = (final_mask[i] > 0).bool().detach().cpu()
+                            ent_i = entropy_tok[i].detach().cpu()
+                            ent_i = ent_i[mask_gi] if mask_gi.numel() > 0 else torch.tensor([])
+                            gen_entropy_list.append([float(x) for x in ent_i.tolist()])
+                        else:
+                            gen_entropy_list.append([])
+
+                    for i in range(B):
+                        self.token_log.append(
+                            {
+                                "example_id": int(ex_ids[i]) if ex_ids else -1,
+                                "prompt_token_ids": prompt_ids_list[i],
+                                "generated_token_ids": gen_ids_list[i],
+                                "prompt_token_nll": prompt_nll_list[i],
+                                "generation_token_entropy": gen_entropy_list[i],
+                            }
+                        )
+            except Exception as e:
+                logger.warning_rank0(f"[TTLTENT] token_log append failed: {e}")
 
         return (total_loss, outputs) if return_outputs else total_loss

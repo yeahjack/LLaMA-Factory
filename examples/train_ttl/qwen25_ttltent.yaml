@@ -91,3 +91,4 @@ use_kl_regularization: false
 
 # Flash Attention
 flash_attn: fa2
+enable_token_diagnostics: false

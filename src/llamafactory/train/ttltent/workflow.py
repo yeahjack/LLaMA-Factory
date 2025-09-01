@@ -197,8 +197,9 @@ def _precompute_reference_ce(
             if isinstance(ex_ids, torch.Tensor):
                 ex_ids = ex_ids.tolist()
 
-            for eid, val in zip(ex_ids, ce.detach().cpu().tolist()):
-                trainer.ref_sentence_ce[int(eid)] = float(val)
+            # 向量化优化：批量更新字典，避免逐个赋值
+            ce_list = ce.detach().cpu().tolist()
+            trainer.ref_sentence_ce.update({int(eid): float(val) for eid, val in zip(ex_ids, ce_list)})
 
             batch_size_now = len(ex_ids)
             total_seen += batch_size_now
@@ -260,6 +261,8 @@ def _load_precomputed_predictions_if_needed(
             logger.info_rank0(f"[TTLTENT] Precompute mode on. Loading predictions from: {precompute_path}")
 
             loaded_token_ids: list[list[int]] = []
+            # 向量化优化：预先获取generation_len避免重复调用
+            gen_len = int(getattr(finetuning_args, "generation_len", 0))
             try:
                 with open(precompute_path, encoding="utf-8") as f:
                     for line in f:
@@ -272,7 +275,7 @@ def _load_precomputed_predictions_if_needed(
                             if not isinstance(text, str):
                                 text = str(text)
                             token_ids = tokenizer.encode(text, add_special_tokens=False)
-                            gen_len = int(getattr(finetuning_args, "generation_len", 0))
+                            # 使用预计算的gen_len，避免重复getattr调用
                             if gen_len > 0:
                                 token_ids = token_ids[:gen_len]
                             loaded_token_ids.append(token_ids)

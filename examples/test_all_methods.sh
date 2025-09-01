@@ -83,9 +83,9 @@ methods=(
 generation_lens=(
   # 0
   # 1
-  4
+   4
   # 8
-  # 16
+  #16
   # 32
   # 64
   # -1
@@ -120,8 +120,8 @@ gpus=(
   # 1
   # 2
   # 3
-  4
-  5
+  # 4
+  # 5
 )
 
 # ===== LoRA 目标组合：新增维度（attn | ffn | attn_ffn | lm_head | attn_lm_head | ffn_lm_head | attn_ffn_lm_head）=====
@@ -171,7 +171,7 @@ USE_FULL_ENTROPY_IN_GENERATION_LIST=("false")
 # 注意：bash 数组不要用逗号分隔
 EATA_SELECT_HIGH_ENTROPY_LIST=(
   "true"
-  "false"
+  # "false"
 )  # 仅对 eata/eata_sdiv 生效
 USE_EMFT_LOSS_LIST=(
   "true"
@@ -180,15 +180,28 @@ USE_EMFT_LOSS_LIST=(
 # 生成模型模式（适用于名字包含 "tent"/"eata" 的方法）："simultaneous" 或 "precompute"
 GEN_MODEL_LIST=("precompute")
 
-LOSS_BALANCING_METHOD_LIST=("gradient_magnitude")
+LOSS_BALANCING_METHOD_LIST=(
+  # "gradient_magnitude"
+  "adaptive_scaling"
+  "moving_average"
+  "uncertainty"
+  "dynamic_weight"
+  )
+# LOSS_BALANCING_METHOD_LIST=(
+#   # "gradient_magnitude"
+#   "adaptive_scaling"
+#   "moving_average"
+#   # "uncertainty"
+#   "dynamic_weight"
+#   )
 ALTERNATING_TRAINING_LIST=("false")
 USE_KL_REGULARIZATION_LIST=("true")
 KL_WEIGHT_LIST=(
   "0.01"
-  # "0.02"
-  # "0.04"
+  #"0.02"
+  "0.04"
   # "0.08"
-  # "0.16"
+  "0.16"
 )
 
 # ===== 仅 ttltent 使用的 gating 开关（"all" | "ttl" | "tent" | "none"）=====
@@ -1085,3 +1098,5 @@ done
 echo "==========================================================="
 echo "==> 脚本所有阶段执行完毕 ✅"
 echo "==========================================================="
+
+sleep 5
