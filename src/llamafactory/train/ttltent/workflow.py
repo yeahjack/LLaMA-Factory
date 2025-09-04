@@ -239,14 +239,9 @@ def _load_precomputed_predictions_if_needed(
             logger.warning_rank0(f"Could not set disable_shuffling: {e}")
 
         try:
-            if hasattr(data_args, "dataset") and isinstance(data_args, list) and len(data_args) > 0:
-                dataset_name = data_args[0]  # type: ignore
-            elif (
-                hasattr(data_args, "dataset")
-                and isinstance(getattr(data_args, "dataset"), list)
-                and len(getattr(data_args, "dataset")) > 0
-            ):
-                dataset_name = getattr(data_args, "dataset")[0]
+            if isinstance(data_args, list) and len(data_args) > 0:
+                dataset_name = data_args[0]
+                logger.info_rank0(f"Using dataset name: {dataset_name}")
             else:
                 dataset_name = "train_dataset"
         except Exception as e:
