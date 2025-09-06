@@ -83,9 +83,9 @@ methods=(
 generation_lens=(
   # 0
   # 1
-   4
+  4
   # 8
-  #16
+  16
   # 32
   # 64
   # -1
@@ -116,11 +116,11 @@ datasets=(
 )
 
 gpus=(
-  0
+  # 0
   # 1
   # 2
   # 3
-  # 4
+  4
   # 5
 )
 
@@ -239,6 +239,11 @@ set_model() {
       TEMPLATE="qwen"
       MODEL_DIR="results_qwen25_7b"
       ;;
+    "qwen25_14b")
+      BASE_MODEL_PATH="Qwen/Qwen2.5-14B-Instruct"
+      TEMPLATE="qwen"
+      MODEL_DIR="results_qwen25_14b"
+      ;;
     "llama32_3b")
       BASE_MODEL_PATH="meta-llama/Llama-3.2-3B-Instruct"
       TEMPLATE="llama3"
@@ -254,11 +259,12 @@ set_model() {
       exit 1
       ;;
   esac
+
   RESULTS_BASE_DIR="${MODEL_DIR}"
   MODEL_SHORT="${MODEL_DIR#results_}"
-  # 按模型选择设置 precompute_results 目录：results_{model}/base_sys_prompt/
   PRECOMPUTE_RESULTS_DIR="results_${MODEL_SHORT}/base_sys_prompt/"
   export WANDB_PROJECT="TTL_${MODEL_SHORT}"
+
   echo "==> 选择模型: ${key}"
   echo "    - BASE_MODEL_PATH=${BASE_MODEL_PATH}"
   echo "    - TEMPLATE=${TEMPLATE}"
@@ -1098,5 +1104,3 @@ done
 echo "==========================================================="
 echo "==> 脚本所有阶段执行完毕 ✅"
 echo "==========================================================="
-
-sleep 5
